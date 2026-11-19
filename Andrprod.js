@@ -2,7 +2,7 @@
     'use strict';
 
     /**
-     * ANDRPROD DD v4.0.1 — Единый агрегатор онлайн-источников для Lampa
+     * ANDRPROD DD v4.0.2 — Единый агрегатор онлайн-источников для Lampa
      * Совместимость: Android, Android TV, Tizen, webOS, Desktop WebView (строгий ES5)
      *
      * Архитектура:
@@ -27,7 +27,7 @@
 
     var PLUGIN_ID = 'andrprod_dd';
     var PLUGIN_NAME = 'ANDRPROD DD';
-    var PLUGIN_VERSION = '4.0.1';
+    var PLUGIN_VERSION = '4.0.2';
     var HUB_COMPONENT = 'andrprod_hub';
     var SEARCH_COMPONENT = 'andrprod_search';
 
@@ -1951,16 +1951,33 @@
     }
 
     function registerMenuEntry() {
+        if (window.andrprod_dd_menu_added) return true;
+        var openHub = function () { HubLauncher.open({ view: 'sources' }); };
         try {
-            if (Lampa.Menu && typeof Lampa.Menu.addButton === 'function' && !window.andrprod_dd_menu_added) {
-                Lampa.Menu.addButton(BrandIcons.getMiniIconSvg(), PLUGIN_NAME, function () {
-                    HubLauncher.open({ view: 'sources' });
-                });
+            if (Lampa.Menu && typeof Lampa.Menu.addButton === 'function') {
+                Lampa.Menu.addButton(BrandIcons.getMiniIconSvg(), PLUGIN_NAME, openHub);
                 window.andrprod_dd_menu_added = true;
+                return true;
             }
         } catch (e) {
-            Diagnostics.logError('Boot.Menu', e);
+            Diagnostics.logError('Boot.MenuApi', e);
         }
+        // Fallback from the documented Lampa plugin pattern: insert a normal menu item.
+        try {
+            var list = $('.menu .menu__list').eq(0);
+            if (list.length) {
+                if (!list.find('.andrprod-dd-menu-item').length) {
+                    var btn = $('<li class="menu__item selector andrprod-dd-menu-item"><div class="menu__text">' + PLUGIN_NAME + '</div></li>');
+                    btn.on('hover:enter click', openHub);
+                    list.append(btn);
+                }
+                window.andrprod_dd_menu_added = true;
+                return true;
+            }
+        } catch (eDom) {
+            Diagnostics.logError('Boot.MenuFallback', eDom);
+        }
+        return false;
     }
 
     function startPlugin() {
@@ -1993,13 +2010,16 @@
         try { SettingsIntegration.init(); } catch (eSet) { Diagnostics.logError('Boot.Settings', eSet); }
         registerMenuEntry();
 
-        if (!SettingsIntegration.initialized) {
-            setTimeout(function () {
-                if (window.Lampa && window.$ && !SettingsIntegration.initialized) {
-                    try { SettingsIntegration.init(); } catch (eRetrySettings) { Diagnostics.logError('Boot.SettingsRetry', eRetrySettings); }
-                }
-            }, 1500);
-        }
+        var retryCount = 0;
+        var uiRetry = setInterval(function () {
+            retryCount++;
+            if (!window.Lampa || !window.$) return;
+            if (!SettingsIntegration.initialized) {
+                try { SettingsIntegration.init(); } catch (eRetrySettings) { Diagnostics.logError('Boot.SettingsRetry', eRetrySettings); }
+            }
+            if (!window.andrprod_dd_menu_added) registerMenuEntry();
+            if ((SettingsIntegration.initialized && window.andrprod_dd_menu_added) || retryCount >= 60) clearInterval(uiRetry);
+        }, 1000);
 
         if (Diagnostics.componentsRegistered.hub && Diagnostics.componentsRegistered.search) {
             Diagnostics.loaded = true;
