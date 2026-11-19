@@ -21,7 +21,9 @@
      * 13. SettingsIntegration   — полный раздел Lampa → Настройки → ANDRPROD DD (Lampa.SettingsApi).
      */
 
-    if (window.andrprod_dd_ready) return;
+    // Версионная защита: старый ANDRPROD не должен блокировать запуск DD 4.x.
+    if (window.andrprod_dd_v4_loading || window.andrprod_dd_v4_ready) return;
+    window.andrprod_dd_v4_loading = true;
 
     var PLUGIN_ID = 'andrprod_dd';
     var PLUGIN_NAME = 'ANDRPROD DD';
@@ -1738,10 +1740,12 @@
     // 13. НАСТРОЙКИ В LAMPA (Lampa → Настройки → ANDRPROD DD)
     // =========================================================================
     var SettingsIntegration = {
+        initialized: false,
         init: function () {
-            if (!Lampa.SettingsApi) return;
+            if (SettingsIntegration.initialized) return true;
+            if (!Lampa.SettingsApi || typeof Lampa.SettingsApi.addComponent !== 'function' || typeof Lampa.SettingsApi.addParam !== 'function') return false;
             try {
-                Lampa.SettingsApi.addComponent({ component: PLUGIN_ID, name: PLUGIN_NAME, icon: BrandIcons.getMiniIconSvg() });
+                Lampa.SettingsApi.addComponent({ component: PLUGIN_ID, name: PLUGIN_NAME, icon: BrandIcons.getMiniIconSvg(), before: 'plugins' });
 
                 // --- Источники ---
                 Lampa.SettingsApi.addParam({
@@ -1808,8 +1812,11 @@
                     field: { name: 'Диагностика ANDRPROD DD', description: 'Версия, статус модулей, ошибки и проверка всех источников' },
                     onChange: function () { HubLauncher.open({ view: 'diagnostics' }); }
                 });
+                SettingsIntegration.initialized = true;
+                return true;
             } catch (e) {
                 Diagnostics.logError('SettingsIntegration', e);
+                return false;
             }
         }
     };
@@ -1921,7 +1928,21 @@
                 version: PLUGIN_VERSION,
                 name: PLUGIN_NAME,
                 description: 'Единый агрегатор онлайн-источников Lampa',
-                component: HUB_COMPONENT
+                component: HUB_COMPONENT,
+                onContextMenu: function () {
+                    return { title: 'Открыть в ANDRPROD DD' };
+                },
+                onContextLauch: function (card) {
+                    Lampa.Activity.push({
+                        url: '',
+                        title: PLUGIN_NAME,
+                        component: SEARCH_COMPONENT,
+                        movie: card || {},
+                        method: (card && (card.media_type === 'tv' || card.first_air_date)) ? 'tv' : 'movie',
+                        scope: 'all',
+                        page: 1
+                    });
+                }
             };
             Diagnostics.manifestRegistered = true;
         } catch (e) {
@@ -1929,11 +1950,24 @@
         }
     }
 
+    function registerMenuEntry() {
+        try {
+            if (Lampa.Menu && typeof Lampa.Menu.addButton === 'function' && !window.andrprod_dd_menu_added) {
+                Lampa.Menu.addButton(BrandIcons.getMiniIconSvg(), PLUGIN_NAME, function () {
+                    HubLauncher.open({ view: 'sources' });
+                });
+                window.andrprod_dd_menu_added = true;
+            }
+        } catch (e) {
+            Diagnostics.logError('Boot.Menu', e);
+        }
+    }
+
     function startPlugin() {
-        if (window.andrprod_dd_ready) return;
+        if (window.andrprod_dd_v4_ready) return true;
         if (!window.Lampa || !window.$) {
-            Diagnostics.logError('Boot', 'Lampa или jQuery ещё не готовы');
-            return;
+            Diagnostics.logError('Boot', 'Ожидание Lampa и jQuery; запуск будет повторён');
+            return false;
         }
 
         registerManifest();
@@ -1949,45 +1983,62 @@
                     Lampa.Component.add(SEARCH_COMPONENT, AndrprodSearchComponent);
                     Diagnostics.componentsRegistered.search = true;
                 }
+            } else {
+                Diagnostics.logError('Boot.Component', 'Lampa.Component.add недоступен');
             }
         } catch (eComp) { Diagnostics.logError('Boot.Component', eComp); }
 
         try { SourceRegistry.resetAndScan(); } catch (eScan) { Diagnostics.logError('Boot.Scan', eScan); }
         try { CardIntegration.init(); } catch (eCard) { Diagnostics.logError('Boot.Card', eCard); }
         try { SettingsIntegration.init(); } catch (eSet) { Diagnostics.logError('Boot.Settings', eSet); }
+        registerMenuEntry();
+
+        if (!SettingsIntegration.initialized) {
+            setTimeout(function () {
+                if (window.Lampa && window.$ && !SettingsIntegration.initialized) {
+                    try { SettingsIntegration.init(); } catch (eRetrySettings) { Diagnostics.logError('Boot.SettingsRetry', eRetrySettings); }
+                }
+            }, 1500);
+        }
 
         if (Diagnostics.componentsRegistered.hub && Diagnostics.componentsRegistered.search) {
             Diagnostics.loaded = true;
             Diagnostics.initialized = true;
+            window.andrprod_dd_v4_ready = true;
+            window.andrprod_dd_v4_loading = false;
             window.andrprod_dd_ready = true;
+            return true;
         }
+        return false;
     }
 
     function bootstrap() {
-        if (!window.Lampa || !window.$) {
-            var attempts = 0;
-            var timer = setInterval(function () {
-                attempts++;
-                if (window.Lampa && window.$) {
+        var attempts = 0;
+        var waitingForApp = false;
+        var timer = setInterval(function () {
+            attempts++;
+            if (window.Lampa && window.$) {
+                if (window.appready) {
                     clearInterval(timer);
-                    bootstrap();
-                } else if (attempts >= 40) {
-                    clearInterval(timer);
-                    Diagnostics.logError('Bootstrap', 'Lampa/jQuery не обнаружены после ожидания');
+                    startPlugin();
+                    return;
                 }
-            }, 250);
-            return;
-        }
-
-        if (window.appready) {
-            startPlugin();
-        } else if (Lampa.Listener && typeof Lampa.Listener.follow === 'function') {
-            Lampa.Listener.follow('app', function (e) {
-                if (e && e.type === 'ready') startPlugin();
-            });
-        } else {
-            startPlugin();
-        }
+                if (!waitingForApp && Lampa.Listener && typeof Lampa.Listener.follow === 'function') {
+                    waitingForApp = true;
+                    Lampa.Listener.follow('app', function (e) {
+                        if (e && e.type === 'ready') {
+                            clearInterval(timer);
+                            startPlugin();
+                        }
+                    });
+                }
+            }
+            if (attempts >= 240) {
+                clearInterval(timer);
+                Diagnostics.logError('Bootstrap', 'Не удалось дождаться готовности Lampa за 60 секунд');
+                window.andrprod_dd_v4_loading = false;
+            }
+        }, 250);
     }
 
     bootstrap();
