@@ -2,7 +2,7 @@
     'use strict';
 
     /**
-     * ANDRPROD DD v4.0.2 — Единый агрегатор онлайн-источников для Lampa
+     * ANDRPROD DD v4.0.1 — Единый агрегатор онлайн-источников для Lampa
      * Совместимость: Android, Android TV, Tizen, webOS, Desktop WebView (строгий ES5)
      *
      * Архитектура:
@@ -21,13 +21,11 @@
      * 13. SettingsIntegration   — полный раздел Lampa → Настройки → ANDRPROD DD (Lampa.SettingsApi).
      */
 
-    // Версионная защита: старый ANDRPROD не должен блокировать запуск DD 4.x.
-    if (window.andrprod_dd_v4_loading || window.andrprod_dd_v4_ready) return;
-    window.andrprod_dd_v4_loading = true;
+    if (window.andrprod_dd_ready) return;
 
     var PLUGIN_ID = 'andrprod_dd';
     var PLUGIN_NAME = 'ANDRPROD DD';
-    var PLUGIN_VERSION = '4.0.2';
+    var PLUGIN_VERSION = '4.0.1';
     var HUB_COMPONENT = 'andrprod_hub';
     var SEARCH_COMPONENT = 'andrprod_search';
 
@@ -308,9 +306,9 @@
     // =========================================================================
     var NON_ONLINE_BLACKLIST = [
         'theme', 'skin', 'style', 'css', 'ui', 'interface', 'design', 'logo', 'icon',
-        'rating', 'kp_rating', 'imdb', 'shots', 'tracks', 'sub', 'subtitle', 'trailer',
+        'rating', 'kp_rating', 'imdb', 'shots', 'tracks', 'subtitle', 'trailer',
         'torrserver', 'torrent', 'jacred', 'parser', 'tmdb_proxy', 'proxy', 'cub',
-        'adblock', 'ads', 'menu', 'background', 'backdrop', 'cardify', 'easymode',
+        'adblock', 'advert', 'menu', 'background', 'backdrop', 'cardify', 'easymode',
         'collection', 'recommend', 'myshows', 'shikimori', 'calendar', 'history', 'sync'
     ];
 
@@ -320,7 +318,7 @@
         { id: 'uaflix', name: 'UAFlix', kind: 'lampac_or_native', patterns: ['uaflix'], buttonHints: ['uaflix'] },
         { id: 'uafilm', name: 'UAFilm', kind: 'lampac_or_native', patterns: ['uafilm'], buttonHints: ['uafilm'] },
         { id: 'line_prime', name: 'Line Prime', kind: 'lampac_or_native', patterns: ['lineprime', 'line_prime', 'line-prime'], buttonHints: ['line prime', 'lineprime'] },
-        { id: 'online_mod', name: 'Online Mod', kind: 'online_mod', patterns: ['online_mod', 'nb557'], buttonHints: ['online_mod', 'онлайн мод', 'online mod'] },
+        { id: 'online_mod', name: 'Online Mod', kind: 'online_mod', patterns: ['online_mod', 'nb557'], buttonHints: ['online_mod', 'онлайн мод', 'online mod', 'lampac--button', 'view--online', 'онлайн'] },
         { id: 'alpaca', name: 'Alpaca', kind: 'lampac_or_native', patterns: ['alpaca'], buttonHints: ['alpaca'] },
         { id: 'lumio', name: 'Lumio', kind: 'lampac_or_native', patterns: ['lumio'], buttonHints: ['lumio'] },
         { id: 'showy', name: 'Showy', kind: 'lampac_or_native', patterns: ['showy'], buttonHints: ['showy'] },
@@ -602,26 +600,46 @@
     }
 
     function parseLampacBalancers(payload) {
-        var out = [];
-        var raw = payload;
+        var out = [], raw = payload;
         if (typeof payload === 'string') {
             try { raw = JSON.parse(payload); } catch (e) { return out; }
         }
-        var list = Object.prototype.toString.call(raw) === '[object Array]'
-            ? raw
-            : (raw && Object.prototype.toString.call(raw.channels) === '[object Array]' ? raw.channels : (raw && Object.prototype.toString.call(raw.results) === '[object Array]' ? raw.results : null));
-        if (!list) return out;
-        var i, it;
-        for (i = 0; i < list.length; i++) {
-            it = list[i];
-            if (!it || typeof it !== 'object' || it.show === false || !it.url) continue;
-            out.push({
-                id: makeSafeId(it.balanser || it.id || it.name || ('bal_' + i)),
-                name: it.name || it.title || it.balanser || ('Источник ' + (i + 1)),
-                url: it.url
-            });
+        if (!raw || typeof raw !== 'object') return out;
+
+        function addList(list) {
+            if (Object.prototype.toString.call(list) !== '[object Array]') return;
+            var i, it, url;
+            for (i = 0; i < list.length; i++) {
+                it = list[i];
+                if (!it || typeof it !== 'object' || it.show === false || it.disabled === true) continue;
+                url = it.url || it.href || it.host || '';
+                if (!url) continue;
+                out.push({
+                    id: makeSafeId(it.balanser || it.id || it.name || ('bal_' + i)),
+                    name: it.name || it.title || it.balanser || ('Источник ' + (i + 1)),
+                    url: url
+                });
+            }
         }
-        return out;
+
+        addList(raw);
+        addList(raw.channels);
+        addList(raw.results);
+        addList(raw.online);
+        addList(raw.balancers);
+        addList(raw.data);
+        if (raw.life && typeof raw.life === 'object') {
+            addList(raw.life.online);
+            addList(raw.life.balancers);
+            addList(raw.life.channels);
+        }
+
+        var unique = [], seen = {}, j, key;
+        for (j = 0; j < out.length; j++) {
+            key = String(out[j].url).replace(/\/+$/, '').toLowerCase();
+            if (!seen[key]) { seen[key] = true; unique.push(out[j]); }
+        }
+        return unique;
     }
 
     function queryLampacBalancer(pluginMeta, bal, mediaMeta, opts, variantIdx, retryCount, callback) {
@@ -639,7 +657,11 @@
             (mediaMeta.year ? '&year=' + encodeURIComponent(mediaMeta.year) : '') +
             (mediaMeta.imdbId ? '&imdb_id=' + encodeURIComponent(mediaMeta.imdbId) : '') +
             (mediaMeta.kinopoiskId ? '&kinopoisk_id=' + encodeURIComponent(mediaMeta.kinopoiskId) : '') +
-            '&serial=' + (mediaMeta.isSeries ? '1' : '0');
+            (mediaMeta.id ? '&id=' + encodeURIComponent(mediaMeta.id) : '') +
+            (mediaMeta.uid ? '&uid=' + encodeURIComponent(mediaMeta.uid) : '') +
+            '&serial=' + (mediaMeta.isSeries ? '1' : '0') +
+            (mediaMeta.season ? '&season=' + encodeURIComponent(mediaMeta.season) : '') +
+            (mediaMeta.episode ? '&episode=' + encodeURIComponent(mediaMeta.episode) : '');
 
         var t0 = Date.now();
         probeEndpoint(reqUrl, opts, function (err, resp) {
@@ -665,7 +687,39 @@
         var out = [];
         var data = rawResp;
         if (typeof rawResp === 'string') {
-            try { data = JSON.parse(rawResp); } catch (e) { return out; }
+            try { data = JSON.parse(rawResp); }
+            catch (e) {
+                var re = /<[^>]*class=["'][^"']*videos__item[^"']*["'][^>]*>/gi;
+                var match, attr, txt, obj, arr, k, itemHtml, u, qm, qt;
+                while ((match = re.exec(rawResp))) {
+                    attr = match[0].match(/data-json=["']([^"']+)["']/i);
+                    if (!attr) continue;
+                    txt = attr[1].replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+                    try {
+                        obj = JSON.parse(txt);
+                        arr = Object.prototype.toString.call(obj) === '[object Array]' ? obj :
+                            (obj.data || obj.results || [obj]);
+                        if (Object.prototype.toString.call(arr) !== '[object Array]') continue;
+                        for (k = 0; k < arr.length; k++) {
+                            itemHtml = arr[k];
+                            if (!itemHtml || typeof itemHtml !== 'object') continue;
+                            u = itemHtml.url || itemHtml.file || itemHtml.stream || '';
+                            qm = itemHtml.quality && typeof itemHtml.quality === 'object' ? itemHtml.quality : null;
+                            qt = itemHtml.maxquality || itemHtml.quality_label ||
+                                (typeof itemHtml.quality === 'string' ? itemHtml.quality : '');
+                            if (qm) {
+                                var qk;
+                                for (qk in qm) if (qm.hasOwnProperty(qk) && qm[qk]) {
+                                    out.push(buildNormalizedVariant(pluginMeta.id, pluginMeta.name, bal.name, itemHtml, qm[qk], qk, qm, latency, mediaMeta));
+                                }
+                            } else if (u) {
+                                out.push(buildNormalizedVariant(pluginMeta.id, pluginMeta.name, bal.name, itemHtml, u, qt, null, latency, mediaMeta));
+                            }
+                        }
+                    } catch (ignoreJson) {}
+                }
+                return out;
+            }
         }
         var list = Object.prototype.toString.call(data) === '[object Array]'
             ? data
@@ -999,7 +1053,8 @@
 
     // =========================================================================
     // 9. ЕДИНЫЙ ПАРАЛЛЕЛЬНЫЙ ПОИСК И КЕШ РЕЗУЛЬТАТОВ (UnifiedSearchEngine)
-    // =========================================================================    var SearchCache = {
+    // =========================================================================
+    var SearchCache = {
         TTL_MS: 300000, // 5 минут
         store: {},
         makeKey: function (meta, scopeId) {
@@ -1277,13 +1332,13 @@
             var hints = prof ? prof.buttonHints : [pluginId];
 
             function findAndTriggerLive() {
-                var btns = $('.full-start-new__buttons .full-start__button, .full-start__buttons .full-start__button');
+                var btns = $('.full-start-new__buttons .full-start__button, .full-start__buttons .full-start__button, .full-start-new__buttons [class*="lampac--button"], .full-start__buttons [class*="lampac--button"]');
                 var matchedEl = null;
                 btns.each(function () {
                     if (matchedEl) return;
                     var el = $(this);
                     if (el.hasClass('andrprod-card-btn')) return;
-                    var txt = safeTrim(el.find('span').text() || el.text()).toLowerCase();
+                    var txt = safeTrim(el.find('span').text() || el.attr('aria-label') || el.attr('title') || el.text()).toLowerCase();
                     var cls = String(el.attr('class') || '').toLowerCase();
                     var h;
                     for (h = 0; h < hints.length; h++) {
@@ -1307,11 +1362,18 @@
             try {
                 if (Lampa.Activity && typeof Lampa.Activity.backward === 'function') {
                     Lampa.Activity.backward();
-                    setTimeout(function () {
-                        if (!findAndTriggerLive() && Lampa.Noty) {
-                            Lampa.Noty.show(PLUGIN_NAME + ': Кнопка плагина «' + (prof ? prof.name : pluginId) + '» не найдена в карточке.');
+                    var attempts = 0;
+                    var retryTimer = setInterval(function () {
+                        attempts++;
+                        if (findAndTriggerLive()) {
+                            clearInterval(retryTimer);
+                            return;
                         }
-                    }, 180);
+                        if (attempts >= 12) {
+                            clearInterval(retryTimer);
+                            if (Lampa.Noty) Lampa.Noty.show(PLUGIN_NAME + ': Кнопка плагина «' + (prof ? prof.name : pluginId) + '» не найдена в карточке.');
+                        }
+                    }, 250);
                     return true;
                 }
             } catch (e) {
@@ -1740,12 +1802,10 @@
     // 13. НАСТРОЙКИ В LAMPA (Lampa → Настройки → ANDRPROD DD)
     // =========================================================================
     var SettingsIntegration = {
-        initialized: false,
         init: function () {
-            if (SettingsIntegration.initialized) return true;
-            if (!Lampa.SettingsApi || typeof Lampa.SettingsApi.addComponent !== 'function' || typeof Lampa.SettingsApi.addParam !== 'function') return false;
+            if (!Lampa.SettingsApi) return;
             try {
-                Lampa.SettingsApi.addComponent({ component: PLUGIN_ID, name: PLUGIN_NAME, icon: BrandIcons.getMiniIconSvg(), before: 'plugins' });
+                Lampa.SettingsApi.addComponent({ component: PLUGIN_ID, name: PLUGIN_NAME, icon: BrandIcons.getMiniIconSvg() });
 
                 // --- Источники ---
                 Lampa.SettingsApi.addParam({
@@ -1812,11 +1872,8 @@
                     field: { name: 'Диагностика ANDRPROD DD', description: 'Версия, статус модулей, ошибки и проверка всех источников' },
                     onChange: function () { HubLauncher.open({ view: 'diagnostics' }); }
                 });
-                SettingsIntegration.initialized = true;
-                return true;
             } catch (e) {
                 Diagnostics.logError('SettingsIntegration', e);
-                return false;
             }
         }
     };
@@ -1857,9 +1914,10 @@
         try {
             if ($('#andrprod-dd-styles').length) return;
             var css = '' +
-                '.andrprod-card-btn{background:transparent!important;border:none!important;box-shadow:none!important;min-width:16.5em!important;height:3.6em!important;padding:0.55em 1.25em!important;display:inline-flex!important;align-items:center;justify-content:center;overflow:visible!important;transition:transform .18s ease,filter .18s ease;}' +
+                '.andrprod-card-btn{background:transparent!important;border:none!important;box-shadow:none!important;min-width:0!important;width:auto!important;height:2.8em!important;padding:0.25em 0.55em!important;display:inline-flex!important;align-items:center;justify-content:center;overflow:visible!important;transition:transform .18s ease,filter .18s ease;}' +
                 '.andrprod-card-btn.focus,.andrprod-card-btn:hover{background:transparent!important;box-shadow:none!important;transform:scale(1.07);filter:drop-shadow(0 0 16px rgba(56,189,248,.92));}' +
-                '.andrprod-card-btn__logo{height:2.45em!important;width:auto!important;max-width:none!important;display:block;overflow:visible;}' +
+                '.andrprod-card-btn__logo{height:1.85em!important;width:auto!important;max-width:8.5em!important;display:block;overflow:visible;}' +
+                '.andrprod-menu-text{white-space:nowrap!important;overflow:visible!important;}' +
                 '.andrprod-hub{padding:1.3em 2em 2em 2em;color:#E2E8F0;}' +
                 '.andrprod-hero{display:flex;gap:1.4em;align-items:flex-start;margin-bottom:1.3em;padding:1.1em 1.3em;border-radius:1em;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.07);}' +
                 '.andrprod-hero__poster{width:7.2em;height:10.5em;border-radius:0.7em;background-color:rgba(255,255,255,.08);background-size:cover;background-position:center;flex-shrink:0;}' +
@@ -1928,21 +1986,7 @@
                 version: PLUGIN_VERSION,
                 name: PLUGIN_NAME,
                 description: 'Единый агрегатор онлайн-источников Lampa',
-                component: HUB_COMPONENT,
-                onContextMenu: function () {
-                    return { title: 'Открыть в ANDRPROD DD' };
-                },
-                onContextLauch: function (card) {
-                    Lampa.Activity.push({
-                        url: '',
-                        title: PLUGIN_NAME,
-                        component: SEARCH_COMPONENT,
-                        movie: card || {},
-                        method: (card && (card.media_type === 'tv' || card.first_air_date)) ? 'tv' : 'movie',
-                        scope: 'all',
-                        page: 1
-                    });
-                }
+                component: HUB_COMPONENT
             };
             Diagnostics.manifestRegistered = true;
         } catch (e) {
@@ -1950,41 +1994,11 @@
         }
     }
 
-    function registerMenuEntry() {
-        if (window.andrprod_dd_menu_added) return true;
-        var openHub = function () { HubLauncher.open({ view: 'sources' }); };
-        try {
-            if (Lampa.Menu && typeof Lampa.Menu.addButton === 'function') {
-                Lampa.Menu.addButton(BrandIcons.getMiniIconSvg(), PLUGIN_NAME, openHub);
-                window.andrprod_dd_menu_added = true;
-                return true;
-            }
-        } catch (e) {
-            Diagnostics.logError('Boot.MenuApi', e);
-        }
-        // Fallback from the documented Lampa plugin pattern: insert a normal menu item.
-        try {
-            var list = $('.menu .menu__list').eq(0);
-            if (list.length) {
-                if (!list.find('.andrprod-dd-menu-item').length) {
-                    var btn = $('<li class="menu__item selector andrprod-dd-menu-item"><div class="menu__text">' + PLUGIN_NAME + '</div></li>');
-                    btn.on('hover:enter click', openHub);
-                    list.append(btn);
-                }
-                window.andrprod_dd_menu_added = true;
-                return true;
-            }
-        } catch (eDom) {
-            Diagnostics.logError('Boot.MenuFallback', eDom);
-        }
-        return false;
-    }
-
     function startPlugin() {
-        if (window.andrprod_dd_v4_ready) return true;
+        if (window.andrprod_dd_ready) return;
         if (!window.Lampa || !window.$) {
-            Diagnostics.logError('Boot', 'Ожидание Lampa и jQuery; запуск будет повторён');
-            return false;
+            Diagnostics.logError('Boot', 'Lampa или jQuery ещё не готовы');
+            return;
         }
 
         registerManifest();
@@ -2000,65 +2014,45 @@
                     Lampa.Component.add(SEARCH_COMPONENT, AndrprodSearchComponent);
                     Diagnostics.componentsRegistered.search = true;
                 }
-            } else {
-                Diagnostics.logError('Boot.Component', 'Lampa.Component.add недоступен');
             }
         } catch (eComp) { Diagnostics.logError('Boot.Component', eComp); }
 
         try { SourceRegistry.resetAndScan(); } catch (eScan) { Diagnostics.logError('Boot.Scan', eScan); }
         try { CardIntegration.init(); } catch (eCard) { Diagnostics.logError('Boot.Card', eCard); }
         try { SettingsIntegration.init(); } catch (eSet) { Diagnostics.logError('Boot.Settings', eSet); }
-        registerMenuEntry();
-
-        var retryCount = 0;
-        var uiRetry = setInterval(function () {
-            retryCount++;
-            if (!window.Lampa || !window.$) return;
-            if (!SettingsIntegration.initialized) {
-                try { SettingsIntegration.init(); } catch (eRetrySettings) { Diagnostics.logError('Boot.SettingsRetry', eRetrySettings); }
-            }
-            if (!window.andrprod_dd_menu_added) registerMenuEntry();
-            if ((SettingsIntegration.initialized && window.andrprod_dd_menu_added) || retryCount >= 60) clearInterval(uiRetry);
-        }, 1000);
 
         if (Diagnostics.componentsRegistered.hub && Diagnostics.componentsRegistered.search) {
             Diagnostics.loaded = true;
             Diagnostics.initialized = true;
-            window.andrprod_dd_v4_ready = true;
-            window.andrprod_dd_v4_loading = false;
             window.andrprod_dd_ready = true;
-            return true;
         }
-        return false;
     }
 
     function bootstrap() {
-        var attempts = 0;
-        var waitingForApp = false;
-        var timer = setInterval(function () {
-            attempts++;
-            if (window.Lampa && window.$) {
-                if (window.appready) {
+        if (!window.Lampa || !window.$) {
+            var attempts = 0;
+            var timer = setInterval(function () {
+                attempts++;
+                if (window.Lampa && window.$) {
                     clearInterval(timer);
-                    startPlugin();
-                    return;
+                    bootstrap();
+                } else if (attempts >= 40) {
+                    clearInterval(timer);
+                    Diagnostics.logError('Bootstrap', 'Lampa/jQuery не обнаружены после ожидания');
                 }
-                if (!waitingForApp && Lampa.Listener && typeof Lampa.Listener.follow === 'function') {
-                    waitingForApp = true;
-                    Lampa.Listener.follow('app', function (e) {
-                        if (e && e.type === 'ready') {
-                            clearInterval(timer);
-                            startPlugin();
-                        }
-                    });
-                }
-            }
-            if (attempts >= 240) {
-                clearInterval(timer);
-                Diagnostics.logError('Bootstrap', 'Не удалось дождаться готовности Lampa за 60 секунд');
-                window.andrprod_dd_v4_loading = false;
-            }
-        }, 250);
+            }, 250);
+            return;
+        }
+
+        if (window.appready) {
+            startPlugin();
+        } else if (Lampa.Listener && typeof Lampa.Listener.follow === 'function') {
+            Lampa.Listener.follow('app', function (e) {
+                if (e && e.type === 'ready') startPlugin();
+            });
+        } else {
+            startPlugin();
+        }
     }
 
     bootstrap();
