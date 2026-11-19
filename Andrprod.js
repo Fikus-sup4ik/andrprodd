@@ -2,7 +2,7 @@
     'use strict';
 
     /**
-     * ANDRPROD DD v4.0.0 — Единый агрегатор онлайн-источников для Lampa
+     * ANDRPROD DD v4.0.1 — Единый агрегатор онлайн-источников для Lampa
      * Совместимость: Android, Android TV, Tizen, webOS, Desktop WebView (строгий ES5)
      *
      * Архитектура:
@@ -27,7 +27,7 @@
 
     var PLUGIN_ID = 'andrprod_dd';
     var PLUGIN_NAME = 'ANDRPROD DD';
-    var PLUGIN_VERSION = '4.0.0';
+    var PLUGIN_VERSION = '4.0.1';
     var HUB_COMPONENT = 'andrprod_hub';
     var SEARCH_COMPONENT = 'andrprod_search';
 
