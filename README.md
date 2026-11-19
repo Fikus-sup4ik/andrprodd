@@ -2,7 +2,7 @@
 
 **Единый центр управления онлайн-источниками для Lampa.**
 
-Текущая версия исходного файла: **3.1.0**
+Текущая версия исходного файла: **4.0.0**
 
 ## Файл плагина
 
@@ -11,7 +11,7 @@
 ## Raw URL
 
 ```
-https://raw.githubusercontent.com/Fikus-sup4ik/andrprodd/main/Andrprod.js
+https://fikus-sup4ik.github.io/andrprodd/Andrprod.js
 ```
 
 ## О проекте
