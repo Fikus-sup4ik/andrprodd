@@ -2012,24 +2012,29 @@
         lastButtonMap: {},
 
         init: function () {
-            if (CardIntegration.initialized) return;
+            if (CardIntegration.initialized) return true;
             if (!Lampa.Listener || typeof Lampa.Listener.follow !== 'function') {
-                Diagnostics.logError('CardIntegration', 'Lampa.Listener.follow недоступен');
-                return;
+                Diagnostics.logError('CardIntegration', 'Lampa.Listener.follow недоступен; повторная попытка будет выполнена при запуске');
+                return false;
             }
-            CardIntegration.initialized = true;
-            Diagnostics.cardIntegrationActive = true;
-
-            Lampa.Listener.follow('full', function (e) {
-                if (e && e.type === 'complite') {
-                    Diagnostics.lastCardEventAt = Date.now();
-                    try {
-                        CardIntegration.attachToCard(e);
-                    } catch (err) {
-                        Diagnostics.logError('CardIntegration.attach', err);
+            try {
+                Lampa.Listener.follow('full', function (e) {
+                    if (e && (e.type === 'complite' || e.type === 'complete')) {
+                        Diagnostics.lastCardEventAt = Date.now();
+                        try {
+                            CardIntegration.attachToCard(e);
+                        } catch (err) {
+                            Diagnostics.logError('CardIntegration.attach', err);
+                        }
                     }
-                }
-            });
+                });
+                CardIntegration.initialized = true;
+                Diagnostics.cardIntegrationActive = true;
+                return true;
+            } catch (err) {
+                Diagnostics.logError('CardIntegration.listen', err);
+                return false;
+            }
         },
 
         attachToCard: function (event) {
@@ -3187,68 +3192,90 @@
     }
 
     function startPlugin() {
-        if (window.andrprod_plugin_ready) return;
+        if (window.andrprod_plugin_ready && Diagnostics.cardIntegrationActive) return true;
 
-        if (!window.Lampa || !window.$) {
-            Diagnostics.logError('Boot', 'Окружение Lampa или jQuery не готово');
-            return;
+        // Lampa загружает API не атомарно. Не отмечаем плагин рабочим,
+        // пока не доступны все API, необходимые для кнопки в карточке.
+        if (!window.Lampa || !window.$ ||
+            !Lampa.Component || typeof Lampa.Component.add !== 'function' ||
+            !Lampa.Listener || typeof Lampa.Listener.follow !== 'function') {
+            return false;
         }
-
-        // Независимый запуск каждого модуля: сбой одного не ломает остальные
-        registerManifest();
-        injectStyles();
 
         try {
-            if (Lampa.Component && typeof Lampa.Component.add === 'function') {
-                Lampa.Component.add(HUB_COMPONENT, AndrprodHubComponent);
-                Diagnostics.componentsRegistered.hub = true;
-                Lampa.Component.add(SEARCH_COMPONENT, AndrprodSearchComponent);
-                Diagnostics.componentsRegistered.search = true;
-            } else {
-                Diagnostics.logError('Boot.Component', 'Lampa.Component.add недоступен');
-            }
-        } catch (eComp) {
-            Diagnostics.logError('Boot.Component', eComp);
-        }
+            registerManifest();
+            injectStyles();
 
-        try { SourceRegistry.resetAndScan(); } catch (eScan) { Diagnostics.logError('Boot.Scan', eScan); }
-        try { CardIntegration.init(); } catch (eCard) { Diagnostics.logError('Boot.Card', eCard); }
-        try { SettingsIntegration.init(); } catch (eSet) { Diagnostics.logError('Boot.Settings', eSet); }
+            Lampa.Component.add(HUB_COMPONENT, AndrprodHubComponent);
+            Diagnostics.componentsRegistered.hub = true;
+            Lampa.Component.add(SEARCH_COMPONENT, AndrprodSearchComponent);
+            Diagnostics.componentsRegistered.search = true;
 
-        // Флаг успешной загрузки выставляется ТОЛЬКО после регистрации основных компонентов!
-        if (Diagnostics.componentsRegistered.hub && Diagnostics.componentsRegistered.search) {
+            // Критически важно: без подписки на карточки не объявляем плагин рабочим.
+            if (!CardIntegration.init()) return false;
+
+            try { SourceRegistry.resetAndScan(); }
+            catch (eScan) { Diagnostics.logError('Boot.Scan', eScan); }
+
+            try { SettingsIntegration.init(); }
+            catch (eSet) { Diagnostics.logError('Boot.Settings', eSet); }
+
             Diagnostics.loaded = true;
             window.andrprod_plugin_ready = true;
             window.andrprod_plugin_loaded = true;
-            try { SourceRegistry.discoverAllPluginSources(); } catch (eDisc) { Diagnostics.logError('Boot.Discover', eDisc); }
+
+            try { SourceRegistry.discoverAllPluginSources(); }
+            catch (eDisc) { Diagnostics.logError('Boot.Discover', eDisc); }
+
+            if (window.console && typeof console.log === 'function') {
+                console.log('[ANDRPROD] Plugin v' + PLUGIN_VERSION + ' initialized; card integration active');
+            }
+            return true;
+        } catch (err) {
+            Diagnostics.logError('Boot', err);
+            window.andrprod_plugin_ready = false;
+            window.andrprod_plugin_loaded = false;
+            return false;
         }
     }
 
     function bootstrap() {
-        if (!window.Lampa) {
-            // Защита от ранней загрузки скрипта до инициализации Lampa
-            var attempts = 0;
-            var waitTimer = setInterval(function () {
-                attempts++;
-                if (window.Lampa) {
-                    clearInterval(waitTimer);
-                    bootstrap();
-                } else if (attempts >= 40) {
-                    clearInterval(waitTimer);
-                    Diagnostics.logError('Bootstrap', 'Lampa не обнаружена после ожидания');
-                }
-            }, 250);
-            return;
+        var attempts = 0;
+        var maxAttempts = 80;
+        var timer = null;
+
+        function tryStart() {
+            if (window.andrprod_plugin_ready && Diagnostics.cardIntegrationActive) {
+                if (timer) clearInterval(timer);
+                return;
+            }
+            attempts++;
+            if (startPlugin()) {
+                if (timer) clearInterval(timer);
+                return;
+            }
+            if (attempts >= maxAttempts) {
+                if (timer) clearInterval(timer);
+                Diagnostics.logError('Bootstrap', 'Lampa API не готово: не удалось зарегистрировать компоненты и обработчик карточки за 20 секунд');
+            }
         }
 
-        if (window.appready) {
-            startPlugin();
-        } else if (Lampa.Listener && typeof Lampa.Listener.follow === 'function') {
-            Lampa.Listener.follow('app', function (e) {
-                if (e && e.type === 'ready') startPlugin();
-            });
-        } else {
-            startPlugin();
+        // Сначала пробуем сразу, затем повторяем ожидание появления API.
+        tryStart();
+        if (!(window.andrprod_plugin_ready && Diagnostics.cardIntegrationActive)) {
+            timer = setInterval(tryStart, 250);
+        }
+
+        // Событие app/ready полезно, но не является единственным способом запуска:
+        // подписка может произойти после события, поэтому оставляем страховочный повтор.
+        if (window.Lampa && Lampa.Listener && typeof Lampa.Listener.follow === 'function') {
+            try {
+                Lampa.Listener.follow('app', function (e) {
+                    if (e && e.type === 'ready') tryStart();
+                });
+            } catch (listenErr) {
+                Diagnostics.logError('Bootstrap.Listener', listenErr);
+            }
         }
     }
 
