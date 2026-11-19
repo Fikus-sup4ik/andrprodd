@@ -2,41 +2,49 @@
     'use strict';
 
     /**
-     * ANDRPROD v3.1.0 — Единый центр управления онлайн-источниками для Lampa
-     * Аудит и восстановление:
-     * - Безопасная инициализация с проверкой window.Lampa, jQuery и регистрацией Lampa.Manifest.plugins.
-     * - Флаг загрузки выставляется ТОЛЬКО после успешной регистрации основных компонентов.
-     * - Независимый запуск модулей + журнал ошибок Diagnostics (без скрывающих пустых catch).
-     * - Строгий белый список онлайн-кинотеатров (без тем, системных расширений и TorrServer).
-     * - Реальные адаптеры источников (Lampac/BWA /lite/events, Lampa.Api.sources, делегирование кнопок, ANDRPROD_API).
-     * - Единый поиск (Ручной с выбором плагинов / Автоматический / Лучший выбор) + TitleResolver без ошибки EN.
-     * - Фильтры по реальным данным: 4K/2160p, 1080p, 720p, SD, HDR, Dolby Vision, С переводом, С субтитрами.
-     * - Экран диагностики ANDRPROD.
-     * - Чистый ES5 для Smart TV (Android TV, Tizen, webOS, Desktop WebView).
+     * ANDRPROD DD v4.0.0 — Единый агрегатор онлайн-источников для Lampa
+     * Совместимость: Android, Android TV, Tizen, webOS, Desktop WebView (строгий ES5)
+     *
+     * Архитектура:
+     * 1.  Diagnostics           — статус загрузки/инициализации, журнал ошибок, проверка всех источников.
+     * 2.  BrandIcons            — прозрачный логотип ANDRPROD DD (без рамки и подложки) и иконки источников.
+     * 3.  StorageManager        — хранение всех настроек в Lampa.Storage (источники, языки, min/max качество, поиск).
+     * 4.  TitleResolver         — извлечение метаданных фильма/сериала (TMDB/IMDB/KP ID, названия, постер, год).
+     * 5.  AdapterFactory        — модульная система адаптеров (getSourceInfo, isAvailable, searchMovie, searchSeries, getStreams, play).
+     * 6.  SourceRegistry        — белый список онлайн-кинотеатров + внешние адаптеры через window.ANDRPROD_API.
+     * 7.  FilterEngine          — фильтрация по языкам (UA/RU/EN/другие), min/max качеству, озвучке, HDR/DV, сортировка.
+     * 8.  BestChoiceEngine      — взвешенный выбор лучшего подтверждённого варианта.
+     * 9.  UnifiedSearchEngine   — параллельный поиск с отменой (net.clear), 1 ретраем при ошибке, дедупликацией и кешем SearchCache.
+     * 10. CardIntegration       — кнопка ANDRPROD DD в карточке фильма/сериала + безопасный запуск живых кнопок (фикс повторного нажатия).
+     * 11. AndrprodSearchComponent — главный экран агрегатора (постер, метаданные, статусы, 50+ результатов, прокрутка, пульт ТВ).
+     * 12. AndrprodHubComponent  — «Выбрать источники» и «Диагностика» с кнопкой «Проверить все источники».
+     * 13. SettingsIntegration   — полный раздел Lampa → Настройки → ANDRPROD DD (Lampa.SettingsApi).
      */
 
-    if (window.andrprod_plugin_ready) return;
+    if (window.andrprod_dd_ready) return;
 
-    var PLUGIN_ID = 'andrprod';
-    var PLUGIN_VERSION = '3.1.0';
+    var PLUGIN_ID = 'andrprod_dd';
+    var PLUGIN_NAME = 'ANDRPROD DD';
+    var PLUGIN_VERSION = '4.0.0';
     var HUB_COMPONENT = 'andrprod_hub';
     var SEARCH_COMPONENT = 'andrprod_search';
 
     // =========================================================================
-    // 1. МОДУЛЬ ДИАГНОСТИКИ И ЛОГИРОВАНИЯ (Diagnostics)
+    // 1. ДИАГНОСТИКА И ЛОГИРОВАНИЕ (Diagnostics)
     // =========================================================================
     var Diagnostics = {
         loaded: false,
+        initialized: false,
         manifestRegistered: false,
-        componentsRegistered: {
-            hub: false,
-            search: false
-        },
+        componentsRegistered: { hub: false, search: false },
         cardIntegrationActive: false,
         lastCardEventAt: 0,
+        lastSearchAt: 0,
         lastSearchDurationMs: 0,
-        unsupportedPlugins: [], // Неизвестные/не-онлайн расширения, не попавшие в каталог
-        errors: [],             // [{ time, module, message }]
+        lastResultCount: 0,
+        unsupportedPlugins: [],
+        lastCheckResults: {}, // sourceId -> { name, ok, status, latency, message, checkedAt }
+        errors: [],
 
         logError: function (moduleName, err) {
             var msg = err && err.message ? err.message : String(err || 'Неизвестная ошибка');
@@ -48,57 +56,59 @@
             if (Diagnostics.errors.length > 50) Diagnostics.errors.length = 50;
             try {
                 if (window.console && typeof console.error === 'function') {
-                    console.error('[ANDRPROD:' + moduleName + ']', msg);
+                    console.error('[ANDRPROD DD:' + moduleName + ']', msg);
                 }
             } catch (e) {}
         },
 
         getReport: function () {
-            var plugins = SourceRegistry.getPlugins();
-            var sources = SourceRegistry.getAllSources();
-            var activeAdapters = [];
+            var adapters = SourceRegistry.getAdapters();
+            var activeCount = 0;
             var i;
-            for (i = 0; i < plugins.length; i++) {
-                activeAdapters.push(plugins[i].name + ' (' + plugins[i].adapterType + ')');
+            for (i = 0; i < adapters.length; i++) {
+                if (StorageManager.isSourceEnabled(adapters[i].getSourceInfo().id)) activeCount++;
             }
             return {
                 version: PLUGIN_VERSION,
                 loaded: Diagnostics.loaded,
+                initialized: Diagnostics.initialized,
                 manifestRegistered: Diagnostics.manifestRegistered,
                 hubRegistered: Diagnostics.componentsRegistered.hub,
                 searchRegistered: Diagnostics.componentsRegistered.search,
                 cardIntegrationActive: Diagnostics.cardIntegrationActive,
-                lastCardEventAt: Diagnostics.lastCardEventAt,
-                onlinePluginsCount: plugins.length,
-                onlinePlugins: plugins,
-                activeAdapters: activeAdapters,
-                sourcesCount: sources.length,
+                discoveredCount: adapters.length,
+                activeCount: activeCount,
+                unsupportedCount: Diagnostics.unsupportedPlugins.length,
                 unsupportedPlugins: Diagnostics.unsupportedPlugins,
+                lastSearchAt: Diagnostics.lastSearchAt,
                 lastSearchDurationMs: Diagnostics.lastSearchDurationMs,
-                errors: Diagnostics.errors
+                lastResultCount: Diagnostics.lastResultCount,
+                lastError: Diagnostics.errors.length ? Diagnostics.errors[0] : null,
+                errors: Diagnostics.errors,
+                lastCheckResults: Diagnostics.lastCheckResults
             };
         }
     };
 
     // =========================================================================
-    // 2. ПРОЗРАЧНЫЙ ЛОГОТИП ANDRPROD И ИКОНКИ ПЛАГИНОВ (BrandIcons)
+    // 2. ПРОЗРАЧНЫЙ ЛОГОТИП ANDRPROD DD И ИКОНКИ (BrandIcons)
     // =========================================================================
     var BrandIcons = {
         getLogoSvg: function (className, uid) {
-            var gradId = 'andrprod_grad_' + (uid || 'main');
+            var gradId = 'andrprod_dd_grad_' + (uid || 'main');
             return (
-                '<svg class="andrprod-logo-svg ' + (className || '') + '" viewBox="0 0 340 58" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" aria-label="ANDRPROD" role="img">' +
+                '<svg class="andrprod-logo-svg ' + (className || '') + '" viewBox="0 0 420 58" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" aria-label="ANDRPROD DD" role="img">' +
                     '<defs>' +
                         '<linearGradient id="' + gradId + '" x1="0%" y1="0%" x2="100%" y2="0%">' +
                             '<stop offset="0%" stop-color="#7DD3FC"/>' +
-                            '<stop offset="45%" stop-color="#38BDF8"/>' +
+                            '<stop offset="48%" stop-color="#38BDF8"/>' +
                             '<stop offset="100%" stop-color="#2563EB"/>' +
                         '</linearGradient>' +
                     '</defs>' +
-                    '<text x="170" y="44" text-anchor="middle" fill="url(#' + gradId + ')" ' +
+                    '<text x="210" y="44" text-anchor="middle" fill="url(#' + gradId + ')" ' +
                         'text-rendering="geometricPrecision" ' +
                         'font-family="\'Segoe UI\', \'Roboto\', \'Helvetica Neue\', Arial, sans-serif" ' +
-                        'font-size="44" font-weight="900" letter-spacing="4">ANDRPROD</text>' +
+                        'font-size="42" font-weight="900" letter-spacing="3.5">ANDRPROD DD</text>' +
                 '</svg>'
             );
         },
@@ -109,98 +119,30 @@
                     '<path d="M4 18L10.5 5H13.5L20 18H16.8L15.4 15H8.6L7.2 18H4ZM9.7 12.4H14.3L12 7.5L9.7 12.4Z" fill="#38BDF8"/>' +
                 '</svg>'
             );
-        },
-
-        getPluginIconHtml: function (plugin) {
-            if (plugin && plugin.nativeIcon) {
-                var raw = String(plugin.nativeIcon);
-                if (raw.indexOf('<svg') !== -1) {
-                    return '<div class="andrprod-plugin-icon is-native">' + raw + '</div>';
-                }
-                if (raw.indexOf('http') === 0 || raw.indexOf('data:image') === 0) {
-                    return (
-                        '<div class="andrprod-plugin-icon is-native">' +
-                            '<img src="' + escapeHtml(raw) + '" alt="' + escapeHtml(plugin.name || '') + '"/>' +
-                        '</div>'
-                    );
-                }
-            }
-
-            var name = (plugin && plugin.name) ? String(plugin.name) : 'PL';
-            var abbr = BrandIcons._makeAbbreviation(name);
-            var accent = BrandIcons._pickAccentColor(plugin ? plugin.id : name);
-
-            return (
-                '<div class="andrprod-plugin-icon" style="border-color:' + accent + '44;background:' + accent + '1A;">' +
-                    '<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">' +
-                        '<text x="24" y="30" text-anchor="middle" fill="' + accent + '" ' +
-                            'font-family="\'Segoe UI\', Roboto, Arial, sans-serif" ' +
-                            'font-size="' + (abbr.length > 2 ? '15' : '18') + '" font-weight="800" letter-spacing="0.8">' +
-                            escapeHtml(abbr) +
-                        '</text>' +
-                    '</svg>' +
-                '</div>'
-            );
-        },
-
-        _makeAbbreviation: function (name) {
-            var clean = safeTrim(String(name || '').replace(/[^a-zA-Zа-яА-ЯёЁ0-9\s]/g, ' ').replace(/\s+/g, ' '));
-            if (!clean) return 'PL';
-            var words = clean.split(' ');
-            if (words.length >= 2) return (words[0].charAt(0) + words[1].charAt(0)).toUpperCase();
-            if (clean.length <= 3) return clean.toUpperCase();
-            return clean.slice(0, 2).toUpperCase();
-        },
-
-        _pickAccentColor: function (seed) {
-            var palette = ['#38BDF8', '#60A5FA', '#34D399', '#A78BFA', '#22D3EE', '#818CF8', '#2DD4BF'];
-            var hash = 0;
-            var s = String(seed || '');
-            var i;
-            for (i = 0; i < s.length; i++) {
-                hash = ((hash << 5) - hash) + s.charCodeAt(i);
-                hash |= 0;
-            }
-            return palette[Math.abs(hash) % palette.length];
         }
     };
 
     // =========================================================================
-    // 3. ХРАНИЛИЩЕ НАСТРОЕК (StorageManager / Config)
+    // 3. ХРАНИЛИЩЕ НАСТРОЕК В LAMPA (StorageManager)
     // =========================================================================
     var STORAGE_KEYS = {
-        mode: 'andrprod_mode',                        // 'manual' | 'auto' | 'best'
-        bestChoice: 'andrprod_best_choice',           // true | false
-        autoSearch: 'andrprod_auto_search',           // true | false
-        hideBroken: 'andrprod_hide_broken',           // true | false
-        timeout: 'andrprod_timeout_ms',               // 3000 | 6000 | 9000 | 12000
-        disabled: 'andrprod_disabled_sources',        // { key: true }
-        disabledPlugins: 'andrprod_disabled_plugins', // { pluginId: true }
-        favorites: 'andrprod_favorite_sources',       // { key: true }
-        favoritePlugins: 'andrprod_favorite_plugins', // { pluginId: true }
-        priorities: 'andrprod_source_priorities',     // [key1, key2, ...]
-        manualSelection: 'andrprod_manual_plugins',   // { pluginId: true }
-        filters: 'andrprod_filters_v3'                // FilterState
+        searchMode: 'andrprod_dd_search_mode',         // 'auto' | 'manual' | 'best'
+        timeoutMs: 'andrprod_dd_timeout_ms',           // 3000 | 6000 | 9000 | 12000
+        retryOnError: 'andrprod_dd_retry_on_error',    // true | false
+        showProgress: 'andrprod_dd_show_progress',     // true | false
+        langUk: 'andrprod_dd_lang_uk',                 // true | false
+        langRu: 'andrprod_dd_lang_ru',                 // true | false
+        langEn: 'andrprod_dd_lang_en',                 // true | false
+        langOther: 'andrprod_dd_lang_other',           // true | false
+        minQuality: 'andrprod_dd_min_quality',         // 'any' | '480p' | '720p' | '1080p' | '2160p' | '4k'
+        maxQuality: 'andrprod_dd_max_quality',         // 'any' | '4k' | '2160p' | '1080p' | '720p' | '480p'
+        prefVoice: 'andrprod_dd_pref_voice',           // 'any' | 'dub' | 'multi' | 'orig'
+        hideUnavailable: 'andrprod_dd_hide_unavail',   // true | false
+        hideUnmatched: 'andrprod_dd_hide_unmatched',   // true | false
+        sortBy: 'andrprod_dd_sort_by',                 // 'priority' | 'quality' | 'speed' | 'name'
+        disabledSources: 'andrprod_dd_disabled_src',   // { sourceId: true }
+        priorities: 'andrprod_dd_priorities'           // [sourceId1, sourceId2, ...]
     };
-
-    function getDefaultFilters() {
-        return {
-            quality: 'all',          // 'all' | '4k' | '2160p' | '1080p' | '720p' | 'sd' | 'unknown'
-            contentType: 'all',      // 'all' | 'movie' | 'series' | 'cartoon' | 'anime'
-            pluginId: 'all',
-            onlyWorking: false,
-            onlyFavorites: false,
-            only4k: false,
-            onlyFullHd: false,
-            onlyHDR: false,
-            onlyDV: false,
-            onlyTranslated: false,
-            onlySubtitles: false,
-            hideUnavailable: false,
-            sortBy: 'priority',
-            searchQuery: ''
-        };
-    }
 
     var StorageManager = {
         get: function (key, defVal) {
@@ -221,129 +163,63 @@
                 Diagnostics.logError('StorageManager.set', e);
             }
         },
-        getMode: function () {
-            var m = StorageManager.get(STORAGE_KEYS.mode, 'manual');
-            if (m === 'auto' || m === 'best' || m === 'manual') return m;
-            return 'manual';
+        getBool: function (key, defVal) {
+            var v = StorageManager.get(key, defVal);
+            if (typeof v === 'boolean') return v;
+            if (v === 'true' || v === 1 || v === '1') return true;
+            if (v === 'false' || v === 0 || v === '0') return false;
+            return !!defVal;
         },
-        setMode: function (mode) {
-            var valid = (mode === 'auto' || mode === 'best') ? mode : 'manual';
-            StorageManager.set(STORAGE_KEYS.mode, valid);
-            if (valid === 'best') StorageManager.setBestChoice(true);
+        getSearchMode: function () {
+            var m = StorageManager.get(STORAGE_KEYS.searchMode, 'auto');
+            return (m === 'manual' || m === 'best' || m === 'auto') ? m : 'auto';
         },
-        isBestChoice: function () {
-            if (StorageManager.getMode() === 'best') return true;
-            var v = StorageManager.get(STORAGE_KEYS.bestChoice, false);
-            return v === true || v === 'true';
+        setSearchMode: function (m) {
+            StorageManager.set(STORAGE_KEYS.searchMode, (m === 'manual' || m === 'best') ? m : 'auto');
         },
-        setBestChoice: function (flag) {
-            StorageManager.set(STORAGE_KEYS.bestChoice, !!flag);
-        },
-        isAutoSearch: function () {
-            var v = StorageManager.get(STORAGE_KEYS.autoSearch, true);
-            return v === true || v === 'true';
-        },
-        setAutoSearch: function (flag) {
-            StorageManager.set(STORAGE_KEYS.autoSearch, !!flag);
-        },
-        isHideBroken: function () {
-            var v = StorageManager.get(STORAGE_KEYS.hideBroken, false);
-            return v === true || v === 'true';
-        },
-        setHideBroken: function (flag) {
-            StorageManager.set(STORAGE_KEYS.hideBroken, !!flag);
-        },
-        getTimeout: function () {
-            var t = parseInt(StorageManager.get(STORAGE_KEYS.timeout, 6000), 10);
+        getTimeoutMs: function () {
+            var t = parseInt(StorageManager.get(STORAGE_KEYS.timeoutMs, 6000), 10);
             if (isNaN(t) || t < 2000 || t > 20000) return 6000;
             return t;
         },
-        setTimeoutMs: function (ms) {
-            StorageManager.set(STORAGE_KEYS.timeout, parseInt(ms, 10) || 6000);
+        isRetryOnError: function () { return StorageManager.getBool(STORAGE_KEYS.retryOnError, true); },
+        isShowProgress: function () { return StorageManager.getBool(STORAGE_KEYS.showProgress, true); },
+        getAllowedLanguages: function () {
+            return {
+                uk: StorageManager.getBool(STORAGE_KEYS.langUk, true),
+                ru: StorageManager.getBool(STORAGE_KEYS.langRu, true),
+                en: StorageManager.getBool(STORAGE_KEYS.langEn, true),
+                other: StorageManager.getBool(STORAGE_KEYS.langOther, true)
+            };
         },
+        getMinQuality: function () { return String(StorageManager.get(STORAGE_KEYS.minQuality, 'any') || 'any'); },
+        getMaxQuality: function () { return String(StorageManager.get(STORAGE_KEYS.maxQuality, 'any') || 'any'); },
+        getPrefVoice: function () { return String(StorageManager.get(STORAGE_KEYS.prefVoice, 'any') || 'any'); },
+        isHideUnavailable: function () { return StorageManager.getBool(STORAGE_KEYS.hideUnavailable, false); },
+        isHideUnmatched: function () { return StorageManager.getBool(STORAGE_KEYS.hideUnmatched, true); },
+        getSortBy: function () { return String(StorageManager.get(STORAGE_KEYS.sortBy, 'priority') || 'priority'); },
         getDisabledMap: function () {
-            var m = StorageManager.get(STORAGE_KEYS.disabled, {});
+            var m = StorageManager.get(STORAGE_KEYS.disabledSources, {});
             return m && typeof m === 'object' ? m : {};
         },
-        isEnabled: function (sourceKey) {
-            return !StorageManager.getDisabledMap()[sourceKey];
-        },
-        setEnabled: function (sourceKey, enabled) {
+        isSourceEnabled: function (id) { return !StorageManager.getDisabledMap()[id]; },
+        setSourceEnabled: function (id, enabled) {
             var m = StorageManager.getDisabledMap();
-            if (enabled) delete m[sourceKey];
-            else m[sourceKey] = true;
-            StorageManager.set(STORAGE_KEYS.disabled, m);
-        },
-        getFavoritesMap: function () {
-            var m = StorageManager.get(STORAGE_KEYS.favorites, {});
-            return m && typeof m === 'object' ? m : {};
-        },
-        isFavorite: function (sourceKey) {
-            return !!StorageManager.getFavoritesMap()[sourceKey];
-        },
-        toggleFavorite: function (sourceKey) {
-            var m = StorageManager.getFavoritesMap();
-            if (m[sourceKey]) delete m[sourceKey];
-            else m[sourceKey] = true;
-            StorageManager.set(STORAGE_KEYS.favorites, m);
-            return !!m[sourceKey];
-        },
-        getDisabledPluginsMap: function () {
-            var m = StorageManager.get(STORAGE_KEYS.disabledPlugins, {});
-            return m && typeof m === 'object' ? m : {};
-        },
-        isPluginEnabled: function (pluginId) {
-            return !StorageManager.getDisabledPluginsMap()[pluginId];
-        },
-        setPluginEnabled: function (pluginId, enabled) {
-            var m = StorageManager.getDisabledPluginsMap();
-            if (enabled) delete m[pluginId];
-            else m[pluginId] = true;
-            StorageManager.set(STORAGE_KEYS.disabledPlugins, m);
-        },
-        getFavoritePluginsMap: function () {
-            var m = StorageManager.get(STORAGE_KEYS.favoritePlugins, {});
-            return m && typeof m === 'object' ? m : {};
-        },
-        isPluginFavorite: function (pluginId) {
-            return !!StorageManager.getFavoritePluginsMap()[pluginId];
-        },
-        togglePluginFavorite: function (pluginId) {
-            var m = StorageManager.getFavoritePluginsMap();
-            if (m[pluginId]) delete m[pluginId];
-            else m[pluginId] = true;
-            StorageManager.set(STORAGE_KEYS.favoritePlugins, m);
-            return !!m[pluginId];
-        },
-        getManualSelectionMap: function () {
-            var m = StorageManager.get(STORAGE_KEYS.manualSelection, {});
-            return m && typeof m === 'object' ? m : {};
-        },
-        isSelectedForManualSearch: function (pluginId) {
-            var m = StorageManager.getManualSelectionMap();
-            // По умолчанию выбраны все включённые онлайн-плагины
-            return m[pluginId] !== false;
-        },
-        toggleManualSelection: function (pluginId) {
-            var m = StorageManager.getManualSelectionMap();
-            var next = (m[pluginId] === false);
-            m[pluginId] = next;
-            StorageManager.set(STORAGE_KEYS.manualSelection, m);
-            return next;
+            if (enabled) delete m[id];
+            else m[id] = true;
+            StorageManager.set(STORAGE_KEYS.disabledSources, m);
         },
         getPriorities: function () {
             var arr = StorageManager.get(STORAGE_KEYS.priorities, []);
             return Object.prototype.toString.call(arr) === '[object Array]' ? arr : [];
         },
-        setPriorities: function (arr) {
-            StorageManager.set(STORAGE_KEYS.priorities, arr || []);
-        },
-        movePriority: function (sourceKey, direction) {
-            var list = SourceRegistry.getAllSources();
+        setPriorities: function (arr) { StorageManager.set(STORAGE_KEYS.priorities, arr || []); },
+        movePriority: function (sourceId, direction) {
+            var adapters = SourceRegistry.getAdapters();
             var ids = [];
             var i;
-            for (i = 0; i < list.length; i++) ids.push(list[i].key);
-            var idx = ids.indexOf(sourceKey);
+            for (i = 0; i < adapters.length; i++) ids.push(adapters[i].getSourceInfo().id);
+            var idx = ids.indexOf(sourceId);
             if (idx === -1) return false;
             var target = idx + direction;
             if (target < 0 || target >= ids.length) return false;
@@ -352,61 +228,32 @@
             ids[target] = tmp;
             StorageManager.setPriorities(ids);
             return true;
-        },
-        getFilters: function () {
-            var def = getDefaultFilters();
-            var saved = StorageManager.get(STORAGE_KEYS.filters, null);
-            if (!saved || typeof saved !== 'object') return def;
-            var k;
-            for (k in def) {
-                if (def.hasOwnProperty(k) && typeof saved[k] !== 'undefined') def[k] = saved[k];
-            }
-            return def;
-        },
-        setFilters: function (patch) {
-            var cur = StorageManager.getFilters();
-            var k;
-            if (patch && typeof patch === 'object') {
-                for (k in patch) if (patch.hasOwnProperty(k)) cur[k] = patch[k];
-            }
-            StorageManager.set(STORAGE_KEYS.filters, cur);
-            return cur;
-        },
-        resetFilters: function () {
-            var def = getDefaultFilters();
-            StorageManager.set(STORAGE_KEYS.filters, def);
-            return def;
         }
     };
 
-    var Config = StorageManager;
-
     // =========================================================================
-    // 4. РАЗРЕШЕНИЕ НАЗВАНИЙ ФИЛЬМОВ И СЕРИАЛОВ (TitleResolver)
+    // 4. МЕТАДАННЫЕ ФИЛЬМА / СЕРИАЛА (TitleResolver)
     // =========================================================================
     var TitleResolver = {
         extractMediaMeta: function (card, explicitMethod) {
             card = card || {};
             var isSeries = TitleResolver.detectIsSeries(card, explicitMethod);
+            var localizedTitle = isSeries ? safeTrim(card.name || card.title) : safeTrim(card.title || card.name);
+            var originalTitle = isSeries ? safeTrim(card.original_name || card.original_title) : safeTrim(card.original_title || card.original_name);
+            var rawDate = String(isSeries ? (card.first_air_date || card.release_date || card.year || '') : (card.release_date || card.first_air_date || card.year || ''));
+            var ym = rawDate.match(/\d{4}/);
+            var year = ym ? ym[0] : '';
 
-            var localizedTitle = '';
-            var originalTitle = '';
-            var rawDate = '';
-
-            if (isSeries) {
-                localizedTitle = safeTrim(String(card.name || card.title || ''));
-                originalTitle = safeTrim(String(card.original_name || card.original_title || ''));
-                rawDate = String(card.first_air_date || card.release_date || card.year || '');
-            } else {
-                localizedTitle = safeTrim(String(card.title || card.name || ''));
-                originalTitle = safeTrim(String(card.original_title || card.original_name || ''));
-                rawDate = String(card.release_date || card.first_air_date || card.year || '');
+            var poster = '';
+            try {
+                if (card.poster_path && window.Lampa && Lampa.TMDB && typeof Lampa.TMDB.image === 'function') {
+                    poster = Lampa.TMDB.image('t/p/w300' + card.poster_path);
+                } else if (card.img) {
+                    poster = card.img;
+                }
+            } catch (eImg) {
+                poster = card.img || '';
             }
-
-            var yearMatch = rawDate.match(/\d{4}/);
-            var year = yearMatch ? yearMatch[0] : '';
-            var altTitles = TitleResolver._extractAlternativeTitles(card);
-            var englishTitle = TitleResolver._extractEnglishTitle(card, originalTitle, altTitles);
 
             var meta = {
                 id: card.id || '',
@@ -415,18 +262,16 @@
                 kinopoiskId: card.kinopoisk_id || card.kp_id || '',
                 mediaType: isSeries ? 'series' : 'movie',
                 isSeries: isSeries,
-                title: localizedTitle || originalTitle || englishTitle || '',
+                title: localizedTitle || originalTitle || 'Без названия',
                 localizedTitle: localizedTitle,
                 originalTitle: originalTitle,
-                englishTitle: englishTitle,
-                alternativeTitles: altTitles,
                 year: year,
+                poster: poster,
+                rating: card.vote_average ? Number(card.vote_average).toFixed(1) : '',
                 numberOfSeasons: card.number_of_seasons || (card.seasons && card.seasons.length ? card.seasons.length : 0),
-                numberOfEpisodes: card.number_of_episodes || 0,
                 originalLanguage: String(card.original_language || '').toLowerCase(),
                 rawCard: card
             };
-
             meta.queryVariants = TitleResolver.buildQueryVariants(meta);
             return meta;
         },
@@ -434,104 +279,31 @@
         detectIsSeries: function (card, explicitMethod) {
             if (explicitMethod === 'tv' || explicitMethod === 'series') return true;
             if (explicitMethod === 'movie') return false;
-            if (card.first_air_date || card.number_of_seasons || card.original_name) return true;
-            if (card.media_type === 'tv') return true;
+            if (card.first_air_date || card.number_of_seasons || card.original_name || card.media_type === 'tv') return true;
             if (card.name && !card.title) return true;
             return false;
         },
 
-        _extractAlternativeTitles: function (card) {
+        buildQueryVariants: function (meta) {
             var out = [];
             var seen = {};
-            function add(val) {
-                var clean = safeTrim(String(val || ''));
-                if (!clean) return;
-                var low = clean.toLowerCase();
-                if (!seen[low]) {
-                    seen[low] = true;
-                    out.push(clean);
-                }
-            }
-            var alt = card.alternative_titles;
-            var list = null;
-            if (alt) {
-                if (Object.prototype.toString.call(alt) === '[object Array]') list = alt;
-                else if (Object.prototype.toString.call(alt.titles) === '[object Array]') list = alt.titles;
-                else if (Object.prototype.toString.call(alt.results) === '[object Array]') list = alt.results;
-            }
-            if (list) {
-                var i;
-                for (i = 0; i < list.length; i++) {
-                    if (typeof list[i] === 'string') add(list[i]);
-                    else if (list[i] && (list[i].title || list[i].name)) add(list[i].title || list[i].name);
-                }
-            }
-            return out;
-        },
-
-        _extractEnglishTitle: function (card, originalTitle, altTitles) {
-            if (card.english_title) return safeTrim(String(card.english_title));
-            if (String(card.original_language || '').toLowerCase() === 'en' && originalTitle) {
-                return originalTitle;
-            }
-            var alt = card.alternative_titles;
-            var list = alt ? (alt.titles || alt.results || null) : null;
-            if (Object.prototype.toString.call(list) === '[object Array]') {
-                var i;
-                for (i = 0; i < list.length; i++) {
-                    var item = list[i];
-                    if (item && (item.iso_3166_1 === 'US' || item.iso_3166_1 === 'GB' || item.iso_639_1 === 'en') && (item.title || item.name)) {
-                        return safeTrim(String(item.title || item.name));
-                    }
-                }
-            }
-            // Если оригинальное название написано на латинице и язык не указан явно как неанглийский
-            if (originalTitle && /^[A-Za-z0-9\s:'\-.,!?&+()]+$/.test(originalTitle)) {
-                var lang = String(card.original_language || '').toLowerCase();
-                if (!lang || lang === 'en') return originalTitle;
-            }
-            return '';
-        },
-
-        buildQueryVariants: function (meta) {
-            var variants = [];
-            var seen = {};
-            function pushVariant(q, label) {
+            function add(q) {
                 var clean = safeTrim(String(q || '').replace(/\s+/g, ' '));
                 if (!clean) return;
-                var key = clean.toLowerCase();
-                if (seen[key]) return;
-                seen[key] = true;
-                variants.push({ query: clean, label: label });
+                var low = clean.toLowerCase();
+                if (!seen[low]) { seen[low] = true; out.push(clean); }
             }
-            function stripYear(s) {
-                return safeTrim(String(s || '').replace(/\s*\(\d{4}\)\s*$/, '').replace(/\s+\d{4}$/, ''));
-            }
-
-            pushVariant(meta.localizedTitle, 'Локализованное');
-            pushVariant(meta.originalTitle, 'Оригинальное');
-            pushVariant(meta.englishTitle, 'Английское');
-
-            var i;
-            for (i = 0; i < Math.min(meta.alternativeTitles.length, 3); i++) {
-                pushVariant(meta.alternativeTitles[i], 'Альтернативное');
-            }
-            if (meta.year) {
-                if (meta.localizedTitle) pushVariant(stripYear(meta.localizedTitle) + ' ' + meta.year, 'Локализованное + год');
-                if (meta.originalTitle) pushVariant(stripYear(meta.originalTitle) + ' ' + meta.year, 'Оригинальное + год');
-                if (meta.englishTitle) pushVariant(stripYear(meta.englishTitle) + ' ' + meta.year, 'Английское + год');
-            }
-            if (meta.localizedTitle) pushVariant(stripYear(meta.localizedTitle), 'Без года');
-            if (meta.originalTitle) pushVariant(stripYear(meta.originalTitle), 'Оригинал без года');
-
-            return variants;
+            add(meta.localizedTitle);
+            add(meta.originalTitle);
+            if (meta.year && meta.localizedTitle) add(meta.localizedTitle + ' ' + meta.year);
+            if (meta.year && meta.originalTitle) add(meta.originalTitle + ' ' + meta.year);
+            return out;
         }
     };
 
     // =========================================================================
-    // 5. СТРОГИЙ БЕЛЫЙ СПИСОК ПОДТВЕРЖДЁННЫХ ОНЛАЙН-КИНОТЕАТРОВ
+    // 5. БЕЛЫЙ СПИСОК ОНЛАЙН-КИНОТЕАТРОВ И ЧЁРНЫЙ СПИСОК
     // =========================================================================
-    // Исключены темы, интерфейс, субтитры, рейтинги, реклама, каталоги и TorrServer.
     var NON_ONLINE_BLACKLIST = [
         'theme', 'skin', 'style', 'css', 'ui', 'interface', 'design', 'logo', 'icon',
         'rating', 'kp_rating', 'imdb', 'shots', 'tracks', 'sub', 'subtitle', 'trailer',
@@ -541,1500 +313,914 @@
     ];
 
     var ONLINE_PLUGIN_WHITELIST = [
-        {
-            id: 'lampac',
-            name: 'Lampac',
-            adapterType: 'lampac_protocol',
-            patterns: ['lampac', '/online.js', 'online_prestige', 'lampa.mx', 'smotret24', 'jin.energy', 'newonline.js'],
-            buttonHints: ['online_prestige', 'lampac', 'онлайн', 'online']
-        },
-        {
-            id: 'bwa',
-            name: 'BWA',
-            adapterType: 'lampac_protocol',
-            patterns: ['bwa.to', '/bwa', 'rc.bwa', 'bwa.js'],
-            buttonHints: ['bwa']
-        },
-        {
-            id: 'alpaca',
-            name: 'Alpaca',
-            adapterType: 'lampac_or_native',
-            patterns: ['alpaca'],
-            buttonHints: ['alpaca']
-        },
-        {
-            id: 'online_mod',
-            name: 'Online Mod',
-            adapterType: 'online_mod',
-            patterns: ['online_mod', 'nb557'],
-            buttonHints: ['online_mod', 'онлайн мод', 'online mod']
-        },
-        {
-            id: 'lumio',
-            name: 'Lumio',
-            adapterType: 'lampac_or_native',
-            patterns: ['lumio'],
-            buttonHints: ['lumio']
-        },
-        {
-            id: 'showy',
-            name: 'Showy',
-            adapterType: 'lampac_or_native',
-            patterns: ['showy'],
-            buttonHints: ['showy']
-        },
-        {
-            id: 'hdrezka',
-            name: 'HDRezka',
-            adapterType: 'native_plugin',
-            patterns: ['hdrezka', 'rezka.js', '/rezka'],
-            buttonHints: ['hdrezka', 'rezka', 'резка']
-        },
-        {
-            id: 'kinopub',
-            name: 'KinoPub',
-            adapterType: 'native_plugin',
-            patterns: ['kinopub', 'kpub'],
-            buttonHints: ['kinopub', 'кинопаб']
-        },
-        {
-            id: 'filmix',
-            name: 'Filmix',
-            adapterType: 'native_plugin',
-            patterns: ['filmix'],
-            buttonHints: ['filmix', 'филмикс']
-        },
-        {
-            id: 'kodik',
-            name: 'Kodik',
-            adapterType: 'native_plugin',
-            patterns: ['kodik'],
-            buttonHints: ['kodik', 'кодик']
-        },
-        {
-            id: 'alloha',
-            name: 'Alloha',
-            adapterType: 'lampac_or_native',
-            patterns: ['alloha'],
-            buttonHints: ['alloha']
-        },
-        {
-            id: 'collaps',
-            name: 'Collaps',
-            adapterType: 'lampac_or_native',
-            patterns: ['collaps'],
-            buttonHints: ['collaps']
-        },
-        {
-            id: 'videocdn',
-            name: 'VideoCDN',
-            adapterType: 'lampac_or_native',
-            patterns: ['videocdn', 'vcdn'],
-            buttonHints: ['videocdn', 'vcdn']
-        },
-        {
-            id: 'ashdi',
-            name: 'Ashdi',
-            adapterType: 'native_plugin',
-            patterns: ['ashdi'],
-            buttonHints: ['ashdi']
-        },
-        {
-            id: 'eneyida',
-            name: 'Eneyida',
-            adapterType: 'native_plugin',
-            patterns: ['eneyida'],
-            buttonHints: ['eneyida']
-        },
-        {
-            id: 'uakino',
-            name: 'UAKino',
-            adapterType: 'native_plugin',
-            patterns: ['uakino'],
-            buttonHints: ['uakino']
-        }
+        { id: 'lampac', name: 'Lampac', kind: 'lampac_protocol', patterns: ['lampac', '/online.js', 'online_prestige', 'lampa.mx', 'smotret24', 'jin.energy', 'newonline.js'], buttonHints: ['online_prestige', 'lampac', 'онлайн', 'online'] },
+        { id: 'bwa', name: 'BWA', kind: 'lampac_protocol', patterns: ['bwa.to', '/bwa', 'rc.bwa', 'bwa.js'], buttonHints: ['bwa'] },
+        { id: 'uaflix', name: 'UAFlix', kind: 'lampac_or_native', patterns: ['uaflix'], buttonHints: ['uaflix'] },
+        { id: 'uafilm', name: 'UAFilm', kind: 'lampac_or_native', patterns: ['uafilm'], buttonHints: ['uafilm'] },
+        { id: 'line_prime', name: 'Line Prime', kind: 'lampac_or_native', patterns: ['lineprime', 'line_prime', 'line-prime'], buttonHints: ['line prime', 'lineprime'] },
+        { id: 'online_mod', name: 'Online Mod', kind: 'online_mod', patterns: ['online_mod', 'nb557'], buttonHints: ['online_mod', 'онлайн мод', 'online mod'] },
+        { id: 'alpaca', name: 'Alpaca', kind: 'lampac_or_native', patterns: ['alpaca'], buttonHints: ['alpaca'] },
+        { id: 'lumio', name: 'Lumio', kind: 'lampac_or_native', patterns: ['lumio'], buttonHints: ['lumio'] },
+        { id: 'showy', name: 'Showy', kind: 'lampac_or_native', patterns: ['showy'], buttonHints: ['showy'] },
+        { id: 'hdrezka', name: 'HDRezka', kind: 'native_only', patterns: ['hdrezka', 'rezka.js', '/rezka'], buttonHints: ['hdrezka', 'rezka', 'резка'] },
+        { id: 'kinopub', name: 'KinoPub', kind: 'native_only', patterns: ['kinopub', 'kpub'], buttonHints: ['kinopub', 'кинопаб'] },
+        { id: 'filmix', name: 'Filmix', kind: 'native_only', patterns: ['filmix'], buttonHints: ['filmix', 'филмикс'] },
+        { id: 'kodik', name: 'Kodik', kind: 'native_only', patterns: ['kodik'], buttonHints: ['kodik', 'кодик'] },
+        { id: 'ashdi', name: 'Ashdi', kind: 'native_only', patterns: ['ashdi'], buttonHints: ['ashdi'] },
+        { id: 'eneyida', name: 'Eneyida', kind: 'native_only', patterns: ['eneyida'], buttonHints: ['eneyida'] },
+        { id: 'uakino', name: 'UAKino', kind: 'native_only', patterns: ['uakino'], buttonHints: ['uakino'] }
     ];
 
-    var IGNORED_BUTTON_CLASSES = [
-        'andrprod-card-btn',
-        'button--book',
-        'button--reaction',
-        'button--options',
-        'button--subscribe',
-        'button--trailer',
-        'view--trailer',
-        'view--torrent'
-    ];
-
-    function isBlacklistedExtension(lowerUrl, lowerName) {
-        var i, word;
+    function isBlacklisted(lowerUrl, lowerName) {
+        var i;
         for (i = 0; i < NON_ONLINE_BLACKLIST.length; i++) {
-            word = NON_ONLINE_BLACKLIST[i];
-            if (lowerUrl.indexOf(word) !== -1 || lowerName.indexOf(word) !== -1) {
-                return true;
-            }
+            if (lowerUrl.indexOf(NON_ONLINE_BLACKLIST[i]) !== -1 || lowerName.indexOf(NON_ONLINE_BLACKLIST[i]) !== -1) return true;
         }
         return false;
     }
 
     // =========================================================================
-    // 6. АДАПТЕРЫ ОБНАРУЖЕНИЯ РЕАЛЬНЫХ ИСТОЧНИКОВ (PluginAdapterEngine)
+    // 6. МОДУЛЬНАЯ СИСТЕМА АДАПТЕРОВ (AdapterFactory)
     // =========================================================================
-    var PluginAdapterEngine = {
-        normalizeSourceRecord: function (plugin, raw) {
-            var srcId = makeSafeId(raw.id || raw.balanser || raw.name || 'entry');
-            var key = plugin.id + '::' + srcId;
-
-            var q = raw.qualities || {};
-            var has4k = typeof q.has4k === 'boolean' ? q.has4k : null;
-            var has2160p = typeof q.has2160p === 'boolean' ? q.has2160p : (has4k === true ? true : null);
-            var has1080p = typeof q.has1080p === 'boolean' ? q.has1080p : null;
-            var has720p = typeof q.has720p === 'boolean' ? q.has720p : null;
-            var hasSD = typeof q.hasSD === 'boolean' ? q.hasSD : null;
-            var hasHDR = typeof q.hasHDR === 'boolean' ? q.hasHDR : null;
-            var hasDV = typeof q.hasDV === 'boolean' ? q.hasDV : null;
-
-            var ct = raw.contentTypes || {};
-            return {
-                key: key,
-                id: srcId,
-                pluginId: plugin.id,
-                pluginName: plugin.name,
-                name: raw.name || plugin.name,
-                balanser: raw.balanser || '',
-                url: raw.url || '',
-                isNativeEntryOnly: !!raw.isNativeEntryOnly,
-                integrationMode: raw.integrationMode || 'plugin_delegate',
-                note: raw.note || '',
-                hasTranslation: typeof raw.hasTranslation === 'boolean' ? raw.hasTranslation : null,
-                hasSubtitles: typeof raw.hasSubtitles === 'boolean' ? raw.hasSubtitles : null,
-                qualities: {
-                    has4k: has4k,
-                    has2160p: has2160p,
-                    has1080p: has1080p,
-                    has720p: has720p,
-                    hasSD: hasSD,
-                    hasHDR: hasHDR,
-                    hasDV: hasDV
-                },
-                contentTypes: {
-                    movies: typeof ct.movies === 'boolean' ? ct.movies : null,
-                    series: typeof ct.series === 'boolean' ? ct.series : null,
-                    cartoons: typeof ct.cartoons === 'boolean' ? ct.cartoons : null,
-                    anime: typeof ct.anime === 'boolean' ? ct.anime : null
-                },
-                adapter: raw.adapter || null
-            };
-        },
-
+    // Единый контракт адаптера:
+    //   getSourceInfo(), isAvailable(cb), searchMovie(meta, opts, cb),
+    //   searchSeries(meta, opts, cb), getStreams(item, meta, cb), play(result, meta)
+    var AdapterFactory = {
         extractOrigin: function (url) {
             if (!url || typeof url !== 'string') return '';
             var m = url.match(/^(https?:\/\/[^\/\?#]+)/i);
             return m ? m[1] : '';
         },
 
-        parseQualityMetadata: function (rawQuality, extraFlags) {
-            var out = {};
-            if (rawQuality && typeof rawQuality === 'object') {
-                out = cloneObj(rawQuality);
-            } else if (rawQuality) {
-                var s = String(rawQuality).toLowerCase();
-                if (s.indexOf('2160') !== -1 || s.indexOf('4k') !== -1 || s.indexOf('uhd') !== -1) {
-                    out.has4k = true; out.has2160p = true; out.has1080p = true; out.has720p = true;
-                } else if (s.indexOf('1080') !== -1 || s.indexOf('fhd') !== -1 || s.indexOf('full hd') !== -1) {
-                    out.has4k = false; out.has1080p = true; out.has720p = true;
-                } else if (s.indexOf('720') !== -1 || s.indexOf('hd') !== -1) {
-                    out.has4k = false; out.has1080p = false; out.has720p = true;
-                } else if (s.indexOf('480') !== -1 || s.indexOf('360') !== -1 || s.indexOf('sd') !== -1) {
-                    out.has4k = false; out.has1080p = false; out.has720p = false; out.hasSD = true;
-                }
-                if (s.indexOf('hdr') !== -1) out.hasHDR = true;
-                if (s.indexOf('dolby vision') !== -1 || s.indexOf('dovi') !== -1 || /\bdv\b/.test(s)) out.hasDV = true;
-            }
-            if (extraFlags && typeof extraFlags === 'object') {
-                if (typeof extraFlags.hdr === 'boolean') out.hasHDR = extraFlags.hdr;
-                if (typeof extraFlags.dv === 'boolean' || typeof extraFlags.dolby_vision === 'boolean') {
-                    out.hasDV = !!(extraFlags.dv || extraFlags.dolby_vision);
-                }
-            }
-            return out;
-        },
+        /**
+         * Создаёт адаптер для Lampac / BWA и Lampac-совместимых серверов (/lite/events).
+         */
+        createLampacAdapter: function (pluginMeta) {
+            var origin = AdapterFactory.extractOrigin(pluginMeta.url);
 
-        parseLampacEventsPayload: function (plugin, payload) {
-            var items = [];
-            if (!payload) return items;
-
-            var rawList = null;
-            if (Object.prototype.toString.call(payload) === '[object Array]') {
-                rawList = payload;
-            } else if (typeof payload === 'string') {
-                try {
-                    var parsed = JSON.parse(payload);
-                    if (Object.prototype.toString.call(parsed) === '[object Array]') rawList = parsed;
-                    else if (parsed && Object.prototype.toString.call(parsed.channels) === '[object Array]') rawList = parsed.channels;
-                    else if (parsed && Object.prototype.toString.call(parsed.results) === '[object Array]') rawList = parsed.results;
-                } catch (eJson) {
-                    return items;
-                }
-            } else if (typeof payload === 'object') {
-                if (Object.prototype.toString.call(payload.channels) === '[object Array]') rawList = payload.channels;
-                else if (Object.prototype.toString.call(payload.results) === '[object Array]') rawList = payload.results;
-            }
-
-            if (!rawList || !rawList.length) return items;
-
-            var i, entry, title, balanser, url;
-            for (i = 0; i < rawList.length; i++) {
-                entry = rawList[i];
-                if (!entry || typeof entry !== 'object' || entry.show === false) continue;
-
-                title = entry.name || entry.title || entry.balanser || '';
-                balanser = entry.balanser || entry.id || '';
-                url = entry.url || '';
-                if (!title) continue;
-
-                items.push(PluginAdapterEngine.normalizeSourceRecord(plugin, {
-                    id: balanser || title,
-                    name: title,
-                    balanser: balanser,
-                    url: url,
-                    isNativeEntryOnly: false,
-                    integrationMode: 'lampac_events',
-                    note: 'Реальный источник сервера (/lite/events)',
-                    qualities: PluginAdapterEngine.parseQualityMetadata(entry.qualities || entry.max_quality || entry.quality, entry),
-                    contentTypes: entry.contentTypes || {},
-                    hasTranslation: typeof entry.hasTranslation === 'boolean' ? entry.hasTranslation : null,
-                    hasSubtitles: typeof entry.hasSubtitles === 'boolean' ? entry.hasSubtitles : null
-                }));
-            }
-            return items;
-        },
-
-        discoverForPlugin: function (plugin, callback) {
-            var self = this;
-
-            if (plugin.customAdapter) {
-                var ad = plugin.customAdapter;
-                if (typeof ad.getSources === 'function') {
-                    var doneAd = false;
-                    var timerAd = setTimeout(function () {
-                        if (doneAd) return;
-                        doneAd = true;
-                        Diagnostics.logError('Adapter:' + plugin.name, 'Тайм-аут получения источников');
-                        callback([]);
-                    }, StorageManager.getTimeout());
-
-                    try {
-                        ad.getSources(function (list) {
-                            if (doneAd) return;
-                            doneAd = true;
-                            clearTimeout(timerAd);
-                            var out = [];
-                            if (Object.prototype.toString.call(list) === '[object Array]') {
-                                var i;
-                                for (i = 0; i < list.length; i++) {
-                                    var item = cloneObj(list[i]);
-                                    item.adapter = ad;
-                                    item.integrationMode = 'direct_adapter';
-                                    out.push(self.normalizeSourceRecord(plugin, item));
-                                }
-                            }
-                            callback(out);
-                        });
-                    } catch (eAd) {
-                        if (!doneAd) {
-                            doneAd = true;
-                            clearTimeout(timerAd);
-                            Diagnostics.logError('Adapter:' + plugin.name, eAd);
-                            callback([]);
-                        }
-                    }
+            function runSearch(mediaMeta, opts, callback) {
+                if (!origin) {
+                    callback({ status: 'unsupported', error: 'Отсутствует HTTP-адрес сервера', results: [] });
                     return;
                 }
+                probeEndpoint(origin + '/lite/events?life=true', opts, function (err, resp) {
+                    if (err || !resp) {
+                        var isStrictLampac = pluginMeta.kind === 'lampac_protocol';
+                        callback({
+                            status: isStrictLampac ? 'error' : 'unsupported',
+                            error: isStrictLampac ? ('Сервер не ответил (/lite/events): ' + (err || 'пустой ответ')) : 'Плагин не поддерживает программный API /lite/events',
+                            results: []
+                        });
+                        return;
+                    }
+                    var balancers = parseLampacBalancers(resp);
+                    if (!balancers.length) {
+                        callback({ status: 'empty', error: '', results: [] });
+                        return;
+                    }
 
-                callback([
-                    self.normalizeSourceRecord(plugin, {
-                        id: ad.id,
-                        name: ad.name || plugin.name,
-                        url: ad.url || plugin.url || '',
-                        isNativeEntryOnly: false,
-                        integrationMode: 'direct_adapter',
-                        note: ad.description || 'Подключён прямой API-адаптер',
-                        qualities: ad.qualities || {},
-                        contentTypes: ad.contentTypes || {},
-                        adapter: ad
-                    })
-                ]);
-                return;
-            }
-
-            var origin = self.extractOrigin(plugin.url);
-            if (origin && (plugin.adapterType === 'lampac_protocol' || plugin.adapterType === 'lampac_or_native')) {
-                self._probeLampacEvents(plugin, origin, function (serverSources) {
-                    if (serverSources && serverSources.length) callback(serverSources);
-                    else callback(self._buildHonestNativeFallback(plugin));
+                    var allResults = [];
+                    var doneCount = 0;
+                    var hadErr = false;
+                    var i;
+                    for (i = 0; i < balancers.length; i++) {
+                        (function (bal) {
+                            queryLampacBalancer(pluginMeta, bal, mediaMeta, opts, 0, 0, function (bErr, list) {
+                                if (bErr) hadErr = true;
+                                if (list && list.length) allResults = allResults.concat(list);
+                                doneCount++;
+                                if (doneCount >= balancers.length) {
+                                    if (allResults.length) callback({ status: 'found', error: '', results: allResults });
+                                    else if (hadErr) callback({ status: 'error', error: 'Ошибки при опросе балансиров', results: [] });
+                                    else callback({ status: 'empty', error: '', results: [] });
+                                }
+                            });
+                        })(balancers[i]);
+                    }
                 });
-                return;
             }
 
-            if (plugin.adapterType === 'online_mod') {
-                callback(self._buildOnlineModSources(plugin));
-                return;
-            }
-
-            callback(self._buildHonestNativeFallback(plugin));
-        },
-
-        _probeLampacEvents: function (plugin, origin, callback) {
-            var self = this;
-            var net = null;
-            try {
-                net = new Lampa.Reguest();
-                net.timeout(StorageManager.getTimeout());
-            } catch (e) {
-                Diagnostics.logError('LampacProbe:' + plugin.name, e);
-                callback([]);
-                return;
-            }
-
-            var endpoint = origin + '/lite/events?life=true';
-            var done = false;
-            var guard = setTimeout(function () {
-                if (done) return;
-                done = true;
-                try { net.clear(); } catch (eC) {}
-                callback([]);
-            }, StorageManager.getTimeout() + 250);
-
-            net.silent(
-                endpoint,
-                function (resp) {
-                    if (done) return;
-                    done = true;
-                    clearTimeout(guard);
-                    callback(self.parseLampacEventsPayload(plugin, resp));
+            return {
+                getSourceInfo: function () {
+                    return {
+                        id: pluginMeta.id,
+                        name: pluginMeta.name,
+                        url: pluginMeta.url || '',
+                        kind: pluginMeta.kind,
+                        supported: true,
+                        integrationLevel: pluginMeta.kind === 'lampac_protocol' ? 'full' : 'probe',
+                        reason: pluginMeta.kind === 'lampac_protocol'
+                            ? 'Поддерживается программный поиск (/lite/events) и прямой запуск'
+                            : 'Проверка /lite/events; при отсутствии API — делегирование штатной кнопки'
+                    };
                 },
-                function () {
-                    if (done) return;
-                    done = true;
-                    clearTimeout(guard);
-                    callback([]);
+                isAvailable: function (cb) {
+                    if (!origin) { cb(false, 'Нет URL сервера', 0); return; }
+                    var t0 = Date.now();
+                    probeEndpoint(origin + '/lite/events?life=true', { noRetry: true }, function (err, resp) {
+                        var lat = Date.now() - t0;
+                        if (err || !resp) {
+                            cb(false, err || 'Сервер недоступен', lat);
+                            return;
+                        }
+                        var bals = parseLampacBalancers(resp);
+                        cb(bals.length > 0, bals.length > 0 ? ('Доступно балансиров: ' + bals.length) : 'Сервер ответил без балансиров', lat);
+                    });
                 },
-                false,
-                { dataType: 'text' }
-            );
+                searchMovie: function (mediaMeta, opts, cb) { runSearch(mediaMeta, opts, cb); },
+                searchSeries: function (mediaMeta, opts, cb) { runSearch(mediaMeta, opts, cb); },
+                getStreams: function (item, mediaMeta, cb) {
+                    cb(null, item && item.streamUrl ? [{ url: item.streamUrl, quality: item.qualityMap || null }] : []);
+                },
+                play: function (result, mediaMeta) {
+                    return launchPlaybackSafe(result, mediaMeta);
+                }
+            };
         },
 
-        _buildOnlineModSources: function (plugin) {
-            var activeBalanser = '';
-            try { activeBalanser = String(Lampa.Storage.get('online_mod_balanser', '') || ''); } catch (e) {}
-            return [
-                PluginAdapterEngine.normalizeSourceRecord(plugin, {
-                    id: activeBalanser || 'native_entry',
-                    name: activeBalanser ? ('Online Mod — ' + activeBalanser) : 'Online Mod (оригинальный интерфейс)',
-                    balanser: activeBalanser,
-                    url: plugin.url || '',
-                    isNativeEntryOnly: true,
-                    integrationMode: 'plugin_delegate',
-                    note: 'Внутренний список закрыт внутри Online Mod — запуск через штатную кнопку плагина.',
-                    qualities: {},
-                    contentTypes: {}
-                })
-            ];
+        /**
+         * Создаёт честный адаптер для закрытых плагинов (Online Mod, HDRezka, KinoPub, и др.),
+         * не имеющих публичного программного API поиска: не выдумывает результаты,
+         * а безопасно делегирует запуск живой кнопке плагина в карточке.
+         */
+        createNativeDelegationAdapter: function (pluginMeta) {
+            return {
+                getSourceInfo: function () {
+                    return {
+                        id: pluginMeta.id,
+                        name: pluginMeta.name,
+                        url: pluginMeta.url || '',
+                        kind: pluginMeta.kind,
+                        supported: false,
+                        integrationLevel: 'partial',
+                        reason: 'Закрытый плагин без публичного JS-API поиска; доступен запуск через оригинальную кнопку в карточке'
+                    };
+                },
+                isAvailable: function (cb) {
+                    if (!pluginMeta.url || pluginMeta.url.indexOf('http') !== 0) {
+                        cb(true, 'Локальный плагин (кнопка карточки)', 0);
+                        return;
+                    }
+                    var t0 = Date.now();
+                    probeEndpoint(pluginMeta.url, { noRetry: true }, function (err) {
+                        cb(!err, !err ? 'Скрипт плагина доступен (без API поиска)' : ('Недоступен: ' + err), Date.now() - t0);
+                    });
+                },
+                searchMovie: function (mediaMeta, opts, cb) {
+                    cb({ status: 'unsupported', error: 'Плагин не предоставляет API программного поиска', results: [] });
+                },
+                searchSeries: function (mediaMeta, opts, cb) {
+                    cb({ status: 'unsupported', error: 'Плагин не предоставляет API программного поиска', results: [] });
+                },
+                getStreams: function (item, mediaMeta, cb) { cb('Программное получение потоков не поддерживается', []); },
+                play: function (result, mediaMeta) {
+                    return CardIntegration.launchPluginLiveButton(pluginMeta.id);
+                }
+            };
         },
 
-        _buildHonestNativeFallback: function (plugin) {
-            return [
-                PluginAdapterEngine.normalizeSourceRecord(plugin, {
-                    id: 'native_entry',
-                    name: plugin.name + ' (оригинальный интерфейс)',
-                    url: plugin.url || '',
-                    isNativeEntryOnly: true,
-                    integrationMode: 'plugin_delegate',
-                    note: 'У плагина нет публичного API внутренних источников — запуск через его штатную кнопку в карточке.',
-                    qualities: {},
-                    contentTypes: {}
-                })
-            ];
+        /**
+         * Оборачивает внешний пользовательский адаптер (window.ANDRPROD_API.registerAdapter)
+         * в стандартный контракт адаптера ANDRPROD DD.
+         */
+        wrapCustomAdapter: function (raw) {
+            return {
+                getSourceInfo: function () {
+                    if (typeof raw.getSourceInfo === 'function') return raw.getSourceInfo();
+                    return {
+                        id: raw.id,
+                        name: raw.name || raw.id,
+                        url: raw.url || '',
+                        kind: 'custom_adapter',
+                        supported: true,
+                        integrationLevel: 'full',
+                        reason: raw.description || 'Пользовательский API-адаптер'
+                    };
+                },
+                isAvailable: function (cb) {
+                    if (typeof raw.isAvailable === 'function') { raw.isAvailable(cb); return; }
+                    if (typeof raw.check === 'function') { raw.check(cb); return; }
+                    cb(true, 'Пользовательский адаптер активен', 0);
+                },
+                searchMovie: function (mediaMeta, opts, cb) {
+                    var fn = typeof raw.searchMovie === 'function' ? raw.searchMovie : raw.search;
+                    if (typeof fn !== 'function') { cb({ status: 'unsupported', error: 'Метод поиска не реализован', results: [] }); return; }
+                    invokeCustomSearch(raw, fn, mediaMeta, opts, cb);
+                },
+                searchSeries: function (mediaMeta, opts, cb) {
+                    var fn = typeof raw.searchSeries === 'function' ? raw.searchSeries : raw.search;
+                    if (typeof fn !== 'function') { cb({ status: 'unsupported', error: 'Метод поиска не реализован', results: [] }); return; }
+                    invokeCustomSearch(raw, fn, mediaMeta, opts, cb);
+                },
+                getStreams: function (item, mediaMeta, cb) {
+                    if (typeof raw.getStreams === 'function') { raw.getStreams(item, mediaMeta, cb); return; }
+                    cb(null, item && item.streamUrl ? [{ url: item.streamUrl, quality: item.qualityMap || null }] : []);
+                },
+                play: function (result, mediaMeta) {
+                    if (typeof raw.play === 'function') return raw.play(result, mediaMeta);
+                    if (typeof raw.open === 'function') { raw.open(mediaMeta ? mediaMeta.rawCard : {}, function () {}, result); return true; }
+                    return launchPlaybackSafe(result, mediaMeta);
+                }
+            };
         }
     };
 
+    function invokeCustomSearch(raw, fn, mediaMeta, opts, cb) {
+        var t0 = Date.now();
+        var finished = false;
+        var timer = setTimeout(function () {
+            if (finished) return;
+            finished = true;
+            cb({ status: 'error', error: 'Таймаут адаптера', results: [] });
+        }, StorageManager.getTimeoutMs());
+        UnifiedSearchEngine._trackTimer(timer);
+
+        try {
+            fn(mediaMeta, mediaMeta.queryVariants, function (err, list) {
+                if (finished) return;
+                finished = true;
+                clearTimeout(timer);
+                if (err) {
+                    Diagnostics.logError('Adapter:' + (raw.name || raw.id), err);
+                    cb({ status: 'error', error: String(err), results: [] });
+                    return;
+                }
+                var normalized = normalizeResultArray(raw.id, raw.name || raw.id, list, Date.now() - t0, mediaMeta);
+                cb({ status: normalized.length ? 'found' : 'empty', error: '', results: normalized });
+            });
+        } catch (e) {
+            if (!finished) {
+                finished = true;
+                clearTimeout(timer);
+                Diagnostics.logError('Adapter:' + (raw.name || raw.id), e);
+                cb({ status: 'error', error: e.message || String(e), results: [] });
+            }
+        }
+    }
+
+    function probeEndpoint(url, opts, callback) {
+        opts = opts || {};
+        var net = null;
+        try {
+            net = new Lampa.Reguest();
+            net.timeout(StorageManager.getTimeoutMs());
+            UnifiedSearchEngine._trackNet(net);
+        } catch (e) {
+            Diagnostics.logError('Network', e);
+            callback('Lampa.Reguest недоступен', null);
+            return;
+        }
+
+        var done = false;
+        var guard = setTimeout(function () {
+            if (done) return;
+            done = true;
+            try { net.clear(); } catch (eC) {}
+            callback('Таймаут (' + Math.round(StorageManager.getTimeoutMs() / 1000) + ' с)', null);
+        }, StorageManager.getTimeoutMs() + 250);
+        UnifiedSearchEngine._trackTimer(guard);
+
+        net.silent(
+            url,
+            function (resp) {
+                if (done) return;
+                done = true;
+                clearTimeout(guard);
+                callback(null, resp);
+            },
+            function () {
+                if (done) return;
+                done = true;
+                clearTimeout(guard);
+                callback('Ошибка сети', null);
+            },
+            false,
+            { dataType: 'text' }
+        );
+    }
+
+    function parseLampacBalancers(payload) {
+        var out = [];
+        var raw = payload;
+        if (typeof payload === 'string') {
+            try { raw = JSON.parse(payload); } catch (e) { return out; }
+        }
+        var list = Object.prototype.toString.call(raw) === '[object Array]'
+            ? raw
+            : (raw && Object.prototype.toString.call(raw.channels) === '[object Array]' ? raw.channels : (raw && Object.prototype.toString.call(raw.results) === '[object Array]' ? raw.results : null));
+        if (!list) return out;
+        var i, it;
+        for (i = 0; i < list.length; i++) {
+            it = list[i];
+            if (!it || typeof it !== 'object' || it.show === false || !it.url) continue;
+            out.push({
+                id: makeSafeId(it.balanser || it.id || it.name || ('bal_' + i)),
+                name: it.name || it.title || it.balanser || ('Источник ' + (i + 1)),
+                url: it.url
+            });
+        }
+        return out;
+    }
+
+    function queryLampacBalancer(pluginMeta, bal, mediaMeta, opts, variantIdx, retryCount, callback) {
+        var variants = mediaMeta.queryVariants || [];
+        if (variantIdx >= Math.min(variants.length, 3)) {
+            callback(null, []);
+            return;
+        }
+        var q = variants[variantIdx];
+        var sep = bal.url.indexOf('?') === -1 ? '?' : '&';
+        var reqUrl = bal.url + sep +
+            'rjson=true' +
+            '&title=' + encodeURIComponent(q) +
+            (mediaMeta.originalTitle ? '&original_title=' + encodeURIComponent(mediaMeta.originalTitle) : '') +
+            (mediaMeta.year ? '&year=' + encodeURIComponent(mediaMeta.year) : '') +
+            (mediaMeta.imdbId ? '&imdb_id=' + encodeURIComponent(mediaMeta.imdbId) : '') +
+            (mediaMeta.kinopoiskId ? '&kinopoisk_id=' + encodeURIComponent(mediaMeta.kinopoiskId) : '') +
+            '&serial=' + (mediaMeta.isSeries ? '1' : '0');
+
+        var t0 = Date.now();
+        probeEndpoint(reqUrl, opts, function (err, resp) {
+            if (err) {
+                // Ограниченный повторный запрос (максимум 1 раз при включённой настройке)
+                if (retryCount < 1 && StorageManager.isRetryOnError() && !opts.noRetry) {
+                    queryLampacBalancer(pluginMeta, bal, mediaMeta, opts, variantIdx, retryCount + 1, callback);
+                    return;
+                }
+                callback(err, []);
+                return;
+            }
+            var parsed = parseLampacStreams(pluginMeta, bal, mediaMeta, resp, Date.now() - t0);
+            if (parsed.length) callback(null, parsed);
+            else queryLampacBalancer(pluginMeta, bal, mediaMeta, opts, variantIdx + 1, 0, callback);
+        });
+    }
+
+    /**
+     * Парсит ВСЕ найденные варианты без искусственного ограничения (20, 30, 50+ вариантов).
+     */
+    function parseLampacStreams(pluginMeta, bal, mediaMeta, rawResp, latency) {
+        var out = [];
+        var data = rawResp;
+        if (typeof rawResp === 'string') {
+            try { data = JSON.parse(rawResp); } catch (e) { return out; }
+        }
+        var list = Object.prototype.toString.call(data) === '[object Array]'
+            ? data
+            : (data && Object.prototype.toString.call(data.data) === '[object Array]' ? data.data : null);
+        if (!list || !list.length) return out;
+
+        var i, item, streamUrl, qMap, qText;
+        for (i = 0; i < list.length; i++) {
+            item = list[i];
+            if (!item || typeof item !== 'object') continue;
+            streamUrl = item.url || item.file || item.stream || '';
+            qMap = (item.quality && typeof item.quality === 'object') ? item.quality : null;
+            qText = item.maxquality || item.quality_label || (typeof item.quality === 'string' ? item.quality : '');
+
+            // Если сервер вернул несколько качеств для одного видео — создаём отдельный вариант на каждое качество!
+            if (qMap) {
+                var qKey;
+                for (qKey in qMap) {
+                    if (!qMap.hasOwnProperty(qKey) || !qMap[qKey]) continue;
+                    out.push(buildNormalizedVariant(pluginMeta.id, pluginMeta.name, bal.name, item, qMap[qKey], qKey, qMap, latency, mediaMeta));
+                }
+            } else if (streamUrl) {
+                out.push(buildNormalizedVariant(pluginMeta.id, pluginMeta.name, bal.name, item, streamUrl, qText, null, latency, mediaMeta));
+            }
+        }
+        return out;
+    }
+
+    function normalizeResultArray(pluginId, pluginName, rawList, latency, mediaMeta) {
+        var out = [];
+        if (Object.prototype.toString.call(rawList) !== '[object Array]') return out;
+        var i, r;
+        for (i = 0; i < rawList.length; i++) {
+            r = rawList[i];
+            if (!r || typeof r !== 'object') continue;
+            out.push(buildNormalizedVariant(
+                pluginId,
+                pluginName,
+                r.sourceName || r.name || pluginName,
+                r,
+                r.streamUrl || r.url || '',
+                r.quality || r.maxquality || '',
+                r.qualityMap || null,
+                typeof r.latency === 'number' ? r.latency : latency,
+                mediaMeta
+            ));
+        }
+        return out;
+    }
+
+    function buildNormalizedVariant(pluginId, pluginName, sourceName, raw, streamUrl, qualityStr, qualityMap, latency, mediaMeta) {
+        var qNum = extractResolutionNumber(qualityStr);
+        var voice = safeTrim(raw.translate || raw.voice || '');
+        var langCode = detectLanguageCode(raw.lang || raw.language || '', voice);
+        var format = safeTrim(raw.format || raw.rip || extractVideoFormat(raw.title || raw.info || ''));
+        var subtitles = raw.subtitles || raw.cc || '';
+        var hdr = !!(raw.hdr || (qualityStr && String(qualityStr).toLowerCase().indexOf('hdr') !== -1));
+        var dv = !!(raw.dv || raw.dolby_vision || (qualityStr && (String(qualityStr).toLowerCase().indexOf('dolby vision') !== -1 || /\bdv\b/i.test(String(qualityStr)))));
+
+        return {
+            pluginId: pluginId,
+            pluginName: pluginName,
+            sourceName: sourceName,
+            matchedTitle: raw.title || raw.matchedTitle || (mediaMeta ? mediaMeta.title : ''),
+            year: raw.year || (mediaMeta ? mediaMeta.year : ''),
+            qualityNum: qNum,                       // 2160 | 1080 | 720 | 480 | 0 (неизвестно)
+            qualityLabel: formatQualityLabel(qNum, hdr, dv),
+            hdr: hdr,
+            dv: dv,
+            voice: voice,
+            langCode: langCode,                     // 'uk' | 'ru' | 'en' | 'other' | 'unknown'
+            langLabel: formatLanguageLabel(langCode),
+            format: format,                         // 'WEBRip' | 'WEB-DL' | 'BDRip' | ''
+            subtitles: subtitles,
+            hasSubtitles: !!(subtitles && (typeof subtitles === 'string' ? subtitles.length : (subtitles.length > 0))),
+            season: raw.season || raw.s || '',
+            episode: raw.episode || raw.e || '',
+            streamUrl: streamUrl || '',
+            qualityMap: qualityMap,
+            canPlay: !!streamUrl,
+            latency: latency || 0
+        };
+    }
+
+    function extractResolutionNumber(str) {
+        if (!str) return 0;
+        var s = String(str).toLowerCase();
+        if (s.indexOf('2160') !== -1 || s.indexOf('4k') !== -1 || s.indexOf('uhd') !== -1) return 2160;
+        if (s.indexOf('1080') !== -1 || s.indexOf('fhd') !== -1 || s.indexOf('full hd') !== -1) return 1080;
+        if (s.indexOf('720') !== -1 || /\bhd\b/.test(s)) return 720;
+        if (s.indexOf('480') !== -1 || s.indexOf('360') !== -1 || /\bsd\b/.test(s)) return 480;
+        return 0;
+    }
+
+    function formatQualityLabel(qNum, hdr, dv) {
+        var base = qNum === 2160 ? '4K / 2160p' : (qNum === 1080 ? '1080p' : (qNum === 720 ? '720p' : (qNum === 480 ? '480p' : 'Неизвестно')));
+        if (dv) base += ' DV';
+        if (hdr) base += ' HDR';
+        return base;
+    }
+
+    function detectLanguageCode(explicitLang, voice) {
+        var raw = (String(explicitLang || '') + ' ' + String(voice || '')).toLowerCase();
+        if (!safeTrim(raw)) return 'unknown';
+        if (/\b(uk|ua|укр|україн|украин)\b/.test(raw) || raw.indexOf('укр') !== -1) return 'uk';
+        if (/\b(ru|rus|рус|дубляж|многоголос|одноголос|lostfilm|hdrezka|rhs|red head)\b/.test(raw) || raw.indexOf('рус') !== -1) return 'ru';
+        if (/\b(en|eng|english|англ|original|оригинал)\b/.test(raw) || raw.indexOf('англ') !== -1) return 'en';
+        return 'other';
+    }
+
+    function formatLanguageLabel(code) {
+        if (code === 'uk') return 'Украинский';
+        if (code === 'ru') return 'Русский';
+        if (code === 'en') return 'Английский';
+        if (code === 'other') return 'Другой';
+        return 'Неизвестно';
+    }
+
+    function extractVideoFormat(text) {
+        if (!text) return '';
+        var m = String(text).match(/\b(WEB-?DL|WEBRip|BDRip|BluRay|HDRip|DVDRip|TS|CAMRip|HLS)\b/i);
+        return m ? m[1].toUpperCase() : '';
+    }
+
+    function launchPlaybackSafe(result, mediaMeta) {
+        if (!result) return false;
+        try {
+            if (result.streamUrl && window.Lampa && Lampa.Player && typeof Lampa.Player.play === 'function') {
+                var playTitle = (mediaMeta && mediaMeta.title ? mediaMeta.title : result.matchedTitle || result.sourceName);
+                if (result.season && result.episode) playTitle += ' • S' + result.season + 'E' + result.episode;
+                Lampa.Player.play({
+                    url: result.streamUrl,
+                    title: playTitle,
+                    quality: result.qualityMap || undefined,
+                    subtitles: result.subtitles || undefined
+                });
+                return true;
+            }
+        } catch (err) {
+            Diagnostics.logError('Player.play', err);
+        }
+        return CardIntegration.launchPluginLiveButton(result.pluginId);
+    }
+
     // =========================================================================
-    // 7. РЕЕСТР ТОЛЬКО ОНЛАЙН-ПЛАГИНОВ И ИХ ИСТОЧНИКОВ (SourceRegistry)
+    // 7. РЕЕСТР АДАПТЕРОВ ИСТОЧНИКОВ (SourceRegistry)
     // =========================================================================
     var SourceRegistry = {
-        plugins: {},
-        sources: {},
-        customAdapters: {},
-        healthCache: {},
+        adapters: {},       // id -> Adapter
+        customAdapters: {}, // id -> wrapped Adapter
 
         resetAndScan: function () {
             var self = this;
-            var discoveredPlugins = {};
-            var unsupportedList = [];
+            var found = {};
+            var unsupported = [];
+            var seenUn = {};
 
-            // 1. Пользовательские API-адаптеры
-            var adId;
-            for (adId in self.customAdapters) {
-                if (!self.customAdapters.hasOwnProperty(adId)) continue;
-                var ad = self.customAdapters[adId];
-                discoveredPlugins[ad.id] = {
-                    id: ad.id,
-                    name: ad.name || ad.id,
-                    url: ad.url || '',
-                    nativeIcon: ad.icon || '',
-                    adapterType: 'custom_adapter',
-                    buttonHints: ad.buttonHints || [ad.id],
-                    detectedVia: 'API-адаптер',
-                    customAdapter: ad
-                };
+            var cid;
+            for (cid in self.customAdapters) {
+                if (self.customAdapters.hasOwnProperty(cid)) found[cid] = self.customAdapters[cid];
             }
 
-            // 2. Установленные плагины Lampa (только белый список онлайн-кинотеатров!)
             var rawPlugins = [];
             try {
                 var stored = Lampa.Storage.get('plugins', []);
                 if (Object.prototype.toString.call(stored) === '[object Array]') rawPlugins = rawPlugins.concat(stored);
-            } catch (e1) {
-                Diagnostics.logError('SourceRegistry.storage', e1);
-            }            try {
+            } catch (e1) { Diagnostics.logError('SourceRegistry.storage', e1); }
+            try {
                 if (Lampa.Manifest && Object.prototype.toString.call(Lampa.Manifest.plugins) === '[object Array]') {
                     rawPlugins = rawPlugins.concat(Lampa.Manifest.plugins);
                 }
-            } catch (e2) {
-                Diagnostics.logError('SourceRegistry.manifest', e2);
-            }
+            } catch (e2) { Diagnostics.logError('SourceRegistry.manifest', e2); }
 
-            var seenUnsupported = {};
-            var i, j, k, p, pUrl, pName, pIcon, lowerUrl, lowerName, matchedProfile;
+            var i, j, k, p, pUrl, pName, lowerUrl, lowerName, matched;
             for (i = 0; i < rawPlugins.length; i++) {
                 p = rawPlugins[i];
                 if (!p) continue;
-                if (typeof p === 'string') {
-                    pUrl = p; pName = ''; pIcon = '';
-                } else {
+                if (typeof p === 'string') { pUrl = p; pName = ''; }
+                else {
                     if (p.status === 0) continue;
                     pUrl = p.url || p.src || '';
                     pName = p.name || p.title || '';
-                    pIcon = p.icon || p.picture || p.logo || '';
                 }
                 if (!pUrl && !pName) continue;
-
                 lowerUrl = String(pUrl).toLowerCase();
                 lowerName = String(pName).toLowerCase();
                 if (lowerUrl.indexOf('andrprod') !== -1 || lowerName.indexOf('andrprod') !== -1) continue;
 
-                // Проверяем чёрный список (темы, интерфейс, TorrServer, субтитры и т.д.)
-                if (isBlacklistedExtension(lowerUrl, lowerName)) {
-                    var blKey = pUrl || pName;
-                    if (!seenUnsupported[blKey]) {
-                        seenUnsupported[blKey] = true;
-                        unsupportedList.push({ name: pName || extractPluginLabel(pUrl), url: pUrl, reason: 'Не является онлайн-кинотеатром' });
+                if (isBlacklisted(lowerUrl, lowerName)) {
+                    if (!seenUn[pUrl || pName]) {
+                        seenUn[pUrl || pName] = true;
+                        unsupported.push({ name: pName || extractPluginLabel(pUrl), url: pUrl, reason: 'Не является онлайн-кинотеатром' });
                     }
                     continue;
                 }
 
-                // Строгая проверка по белому списку подтверждённых онлайн-плагинов
-                matchedProfile = null;
+                matched = null;
                 for (j = 0; j < ONLINE_PLUGIN_WHITELIST.length; j++) {
                     var prof = ONLINE_PLUGIN_WHITELIST[j];
                     for (k = 0; k < prof.patterns.length; k++) {
                         if (lowerUrl.indexOf(prof.patterns[k]) !== -1 || lowerName.indexOf(prof.patterns[k]) !== -1) {
-                            matchedProfile = prof;
+                            matched = prof;
                             break;
                         }
                     }
-                    if (matchedProfile) break;
+                    if (matched) break;
                 }
 
-                if (matchedProfile) {
-                    if (!discoveredPlugins[matchedProfile.id]) {
-                        discoveredPlugins[matchedProfile.id] = {
-                            id: matchedProfile.id,
-                            name: pName || matchedProfile.name,
-                            url: pUrl,
-                            nativeIcon: pIcon,
-                            adapterType: matchedProfile.adapterType,
-                            buttonHints: matchedProfile.buttonHints,
-                            detectedVia: 'Подтверждённый онлайн-плагин'
-                        };
-                    } else {
-                        if (pUrl && !discoveredPlugins[matchedProfile.id].url) discoveredPlugins[matchedProfile.id].url = pUrl;
-                        if (pIcon && !discoveredPlugins[matchedProfile.id].nativeIcon) discoveredPlugins[matchedProfile.id].nativeIcon = pIcon;
+                if (matched) {
+                    if (!found[matched.id]) {
+                        var meta = { id: matched.id, name: pName || matched.name, url: pUrl, kind: matched.kind, buttonHints: matched.buttonHints };
+                        found[matched.id] = (matched.kind === 'lampac_protocol' || matched.kind === 'lampac_or_native')
+                            ? AdapterFactory.createLampacAdapter(meta)
+                            : AdapterFactory.createNativeDelegationAdapter(meta);
                     }
                 } else {
-                    // Неизвестные расширения НЕ добавляются в каталог — только в диагностику
-                    var unkKey = pUrl || pName;
-                    if (!seenUnsupported[unkKey]) {
-                        seenUnsupported[unkKey] = true;
-                        unsupportedList.push({
-                            name: pName || extractPluginLabel(pUrl),
-                            url: pUrl,
-                            reason: 'Нет подтверждения функции онлайн-просмотра (не в белом списке)'
-                        });
+                    if (!seenUn[pUrl || pName]) {
+                        seenUn[pUrl || pName] = true;
+                        unsupported.push({ name: pName || extractPluginLabel(pUrl), url: pUrl, reason: 'Нет подтверждённого адаптера онлайн-источника' });
                     }
                 }
             }
 
-            Diagnostics.unsupportedPlugins = unsupportedList;
-            self.plugins = discoveredPlugins;
-
-            var pid;
-            var newSources = {};
-            for (pid in self.plugins) {
-                if (!self.plugins.hasOwnProperty(pid)) continue;
-                var existing = self.getPluginSources(pid);
-                if (existing.length) {
-                    for (i = 0; i < existing.length; i++) newSources[existing[i].key] = existing[i];
-                } else {
-                    var fb = PluginAdapterEngine._buildHonestNativeFallback(self.plugins[pid]);
-                    for (i = 0; i < fb.length; i++) newSources[fb[i].key] = fb[i];
-                }
-            }
-            self.sources = newSources;
-            return self.getPlugins();
+            Diagnostics.unsupportedPlugins = unsupported;
+            self.adapters = found;
+            return self.getAdapters();
         },
 
-        discoverAllPluginSources: function (onPluginReady, onAllDone) {
-            var self = this;
-            var pluginList = self.getPlugins();
-            var total = pluginList.length;
-            if (!total) {
-                if (onAllDone) onAllDone();
-                return;
-            }
-            var finished = 0;
-            var i;
-            for (i = 0; i < total; i++) {
-                (function (pl) {
-                    PluginAdapterEngine.discoverForPlugin(pl, function (discoveredList) {
-                        var key;
-                        for (key in self.sources) {
-                            if (self.sources.hasOwnProperty(key) && self.sources[key].pluginId === pl.id) delete self.sources[key];
-                        }
-                        var listToStore = (discoveredList && discoveredList.length)
-                            ? discoveredList
-                            : PluginAdapterEngine._buildHonestNativeFallback(pl);
-                        var j;
-                        for (j = 0; j < listToStore.length; j++) self.sources[listToStore[j].key] = listToStore[j];
-
-                        finished++;
-                        if (onPluginReady) onPluginReady(pl, listToStore);
-                        if (finished >= total && onAllDone) onAllDone();
-                    });
-                })(pluginList[i]);
-            }
-        },
-
-        registerAdapter: function (adapter) {
-            if (!adapter || !adapter.id) return false;
-            this.customAdapters[adapter.id] = adapter;
-            this.resetAndScan();
-            this.discoverAllPluginSources();
+        registerAdapter: function (rawAdapter) {
+            if (!rawAdapter || !rawAdapter.id) return false;
+            var wrapped = AdapterFactory.wrapCustomAdapter(rawAdapter);
+            this.customAdapters[rawAdapter.id] = wrapped;
+            this.adapters[rawAdapter.id] = wrapped;
             return true;
         },
 
-        getPlugins: function () {
+        getAdapters: function () {
             var list = [];
             var id;
-            for (id in this.plugins) if (this.plugins.hasOwnProperty(id)) list.push(this.plugins[id]);
+            for (id in this.adapters) if (this.adapters.hasOwnProperty(id)) list.push(this.adapters[id]);
+            var prio = StorageManager.getPriorities();
             list.sort(function (a, b) {
-                var fa = StorageManager.isPluginFavorite(a.id) ? 1 : 0;
-                var fb = StorageManager.isPluginFavorite(b.id) ? 1 : 0;
-                if (fa !== fb) return fb - fa;
-                return String(a.name).localeCompare(String(b.name));
-            });
-            return list;
-        },
-
-        getPluginById: function (pluginId) {
-            return this.plugins[pluginId] || null;
-        },
-
-        getPluginSources: function (pluginId) {
-            var list = [];
-            var key;
-            for (key in this.sources) {
-                if (this.sources.hasOwnProperty(key) && this.sources[key].pluginId === pluginId) list.push(this.sources[key]);
-            }
-            return list;
-        },
-
-        getAllSources: function () {
-            var list = [];
-            var key;
-            for (key in this.sources) if (this.sources.hasOwnProperty(key)) list.push(this.sources[key]);
-            return list;
-        },
-
-        getSortedSources: function (options) {
-            options = options || {};
-            var filters = getDefaultFilters();
-            if (options.onlyFavorites) filters.onlyFavorites = true;
-            if (options.hideBroken || (options.respectHideBroken && StorageManager.isHideBroken())) filters.hideUnavailable = true;
-            var list = this.getAllSources();
-            if (options.onlyEnabled) {
-                var out = [];
-                var i;
-                for (i = 0; i < list.length; i++) {
-                    if (StorageManager.isEnabled(list[i].key) && StorageManager.isPluginEnabled(list[i].pluginId)) out.push(list[i]);
-                }
-                list = out;
-            }
-            return FilterEngine.apply(list, filters);
-        },
-
-        getHealth: function (idOrKey) {
-            if (this.healthCache[idOrKey]) return this.healthCache[idOrKey];
-            if (idOrKey && String(idOrKey).indexOf('::') !== -1) {
-                var pid = String(idOrKey).split('::')[0];
-                if (this.healthCache[pid]) return this.healthCache[pid];
-            }
-            var pl = this.plugins[idOrKey];
-            if (pl && !pl.url && pl.adapterType !== 'custom_adapter') {
-                return { status: 'button_only', latency: 0, checkedAt: 0, message: 'Штатная кнопка плагина' };
-            }
-            return { status: 'unknown', latency: 0, checkedAt: 0, message: 'Не проверен' };
-        }
-    };
-
-    // =========================================================================
-    // 8. ФИЛЬТРАЦИЯ И КАЧЕСТВО ПО РЕАЛЬНЫМ ДАННЫМ (FilterEngine)
-    // =========================================================================
-    var FilterEngine = {
-        apply: function (sources, filters) {
-            filters = filters || StorageManager.getFilters();
-            var result = [];
-            var qLower = safeTrim(String(filters.searchQuery || '')).toLowerCase();
-            var i, src, health;
-
-            for (i = 0; i < sources.length; i++) {
-                src = sources[i];
-                health = SourceRegistry.getHealth(src.key || src.pluginId);
-
-                if (!filters.includeHidden && src.key && !StorageManager.isEnabled(src.key)) continue;
-
-                if (qLower) {
-                    var hay = (String(src.name || src.sourceName || '') + ' ' + String(src.pluginName || '') + ' ' + String(src.voice || '')).toLowerCase();
-                    if (hay.indexOf(qLower) === -1) continue;
-                }
-
-                if (filters.pluginId && filters.pluginId !== 'all' && src.pluginId !== filters.pluginId) continue;
-
-                // Качество — строго по реальным данным
-                if (filters.quality && filters.quality !== 'all') {
-                    if (!FilterEngine.matchesQuality(src, filters.quality)) continue;
-                }
-                if (filters.only4k && (!src.qualities || src.qualities.has4k !== true)) continue;
-                if (filters.onlyFullHd && (!src.qualities || src.qualities.has1080p !== true)) continue;
-                if (filters.onlyHDR && (!src.qualities || src.qualities.hasHDR !== true)) continue;
-                if (filters.onlyDV && (!src.qualities || src.qualities.hasDV !== true)) continue;
-
-                // С переводом / С субтитрами — строго по реальным данным
-                if (filters.onlyTranslated) {
-                    var hasTr = (src.hasTranslation === true) || !!safeTrim(String(src.voice || ''));
-                    if (!hasTr) continue;
-                }
-                if (filters.onlySubtitles) {
-                    var hasSub = (src.hasSubtitles === true) || !!safeTrim(String(src.subtitles || ''));
-                    if (!hasSub) continue;
-                }
-
-                if (filters.contentType && filters.contentType !== 'all') {
-                    if (!FilterEngine.matchesContentType(src, filters.contentType)) continue;
-                }
-                if (filters.onlyWorking) {
-                    if (health.status !== 'online' && health.status !== 'button_only' && src.status !== 'found') continue;
-                }
-                if (filters.hideUnavailable) {
-                    if (health.status === 'offline' || health.status === 'unsupported') continue;
-                }
-                if (filters.onlyFavorites) {
-                    if (!StorageManager.isFavorite(src.key) && !StorageManager.isPluginFavorite(src.pluginId)) continue;
-                }
-
-                result.push(src);
-            }
-
-            return FilterEngine.sort(result, filters.sortBy || 'priority');
-        },
-
-        matchesQuality: function (src, qualityFilter) {
-            var q = src.qualities || {};
-            if (qualityFilter === '4k') return q.has4k === true;
-            if (qualityFilter === '2160p') return q.has2160p === true;
-            if (qualityFilter === '1080p') return q.has1080p === true;
-            if (qualityFilter === '720p') return q.has720p === true;
-            if (qualityFilter === 'sd') return q.hasSD === true;
-            if (qualityFilter === 'unknown') {
-                return q.has4k !== true && q.has2160p !== true && q.has1080p !== true && q.has720p !== true && q.hasSD !== true;
-            }
-            return true;
-        },
-
-        matchesContentType: function (src, typeFilter) {
-            var ct = src.contentTypes || {};
-            if (typeFilter === 'movie') return ct.movies === true;
-            if (typeFilter === 'series') return ct.series === true;
-            if (typeFilter === 'cartoon') return ct.cartoons === true;
-            if (typeFilter === 'anime') return ct.anime === true;
-            return true;
-        },
-
-        getQualityScore: function (src) {
-            var q = src.qualities || {};
-            if (q.has4k === true || q.has2160p === true) return 400;
-            if (q.has1080p === true) return 300;
-            if (q.has720p === true) return 200;
-            if (q.hasSD === true) return 100;
-            return 0;
-        },
-
-        getQualityLabel: function (src) {
-            var q = src.qualities || {};
-            var base = 'Неизвестно';
-            if (q.has4k === true || q.has2160p === true) base = '4K / 2160p';
-            else if (q.has1080p === true) base = '1080p / Full HD';
-            else if (q.has720p === true) base = '720p / HD';
-            else if (q.hasSD === true) base = 'SD';
-
-            var extras = [];
-            if (q.hasDV === true) extras.push('Dolby Vision');
-            if (q.hasHDR === true) extras.push('HDR');
-            return extras.length ? (base + ' • ' + extras.join(' / ')) : base;
-        },
-
-        sort: function (list, sortBy) {
-            var priorities = StorageManager.getPriorities();
-            var copy = list.slice(0);
-            copy.sort(function (a, b) {
-                var nameA = String(a.name || a.sourceName || '');
-                var nameB = String(b.name || b.sourceName || '');
-                if (sortBy === 'name') return nameA.localeCompare(nameB);
-                if (sortBy === 'quality') {
-                    var qa = FilterEngine.getQualityScore(a);
-                    var qb = FilterEngine.getQualityScore(b);
-                    if (qa !== qb) return qb - qa;
-                    return nameA.localeCompare(nameB);
-                }
-                if (sortBy === 'speed') {
-                    var la = (typeof a.latency === 'number' && a.latency > 0) ? a.latency : (SourceRegistry.getHealth(a.key).latency || 999999);
-                    var lb = (typeof b.latency === 'number' && b.latency > 0) ? b.latency : (SourceRegistry.getHealth(b.key).latency || 999999);
-                    if (la !== lb) return la - lb;
-                    return nameA.localeCompare(nameB);
-                }
-
-                var pa = priorities.indexOf(a.key);
-                var pb = priorities.indexOf(b.key);
+                var ia = a.getSourceInfo().id;
+                var ib = b.getSourceInfo().id;
+                var pa = prio.indexOf(ia);
+                var pb = prio.indexOf(ib);
                 if (pa !== -1 && pb !== -1) return pa - pb;
                 if (pa !== -1) return -1;
                 if (pb !== -1) return 1;
+                return String(a.getSourceInfo().name).localeCompare(String(b.getSourceInfo().name));
+            });
+            return list;
+        },
 
-                var fa = StorageManager.isFavorite(a.key) ? 1 : 0;
-                var fb = StorageManager.isFavorite(b.key) ? 1 : 0;
-                if (fa !== fb) return fb - fa;
+        getAdapterById: function (id) { return this.adapters[id] || null; }
+    };
 
-                var qsa = FilterEngine.getQualityScore(a);
-                var qsb = FilterEngine.getQualityScore(b);
-                if (qsa !== qsb) return qsb - qsa;
+    // =========================================================================
+    // 8. ФИЛЬТРАЦИЯ (ЯЗЫКИ + MIN/MAX КАЧЕСТВО + ОЗВУЧКА + СОРТИРОВКА)
+    // =========================================================================
+    var FilterEngine = {
+        qualityToNum: function (qStr) {
+            if (qStr === '4k' || qStr === '2160p') return 2160;
+            if (qStr === '1080p') return 1080;
+            if (qStr === '720p') return 720;
+            if (qStr === '480p') return 480;
+            return 0;
+        },
 
-                return nameA.localeCompare(nameB);
+        apply: function (results) {
+            var langs = StorageManager.getAllowedLanguages();
+            var minQ = FilterEngine.qualityToNum(StorageManager.getMinQuality());
+            var maxQ = FilterEngine.qualityToNum(StorageManager.getMaxQuality());
+            var hideUnmatched = StorageManager.isHideUnmatched();
+            var prefVoice = StorageManager.getPrefVoice();
+
+            var out = [];
+            var i, r;
+            for (i = 0; i < results.length; i++) {
+                r = results[i];
+
+                // 1. Языковой фильтр (например, можно отключить английский)
+                if (r.langCode === 'uk' && !langs.uk) continue;
+                if (r.langCode === 'ru' && !langs.ru) continue;
+                if (r.langCode === 'en' && !langs.en) continue;
+                if (r.langCode === 'other' && !langs.other) continue;
+
+                // 2. Минимальное / максимальное качество (строго по реальным данным!)
+                if (minQ > 0) {
+                    if (r.qualityNum === 0 && hideUnmatched) continue;
+                    if (r.qualityNum > 0 && r.qualityNum < minQ) continue;
+                }
+                if (maxQ > 0 && r.qualityNum > maxQ) continue;
+
+                // 3. Предпочитаемая озвучка (если включено скрытие неподходящих)
+                if (prefVoice !== 'any' && hideUnmatched && r.voice) {
+                    var vLow = r.voice.toLowerCase();
+                    if (prefVoice === 'dub' && vLow.indexOf('дубляж') === -1 && vLow.indexOf('dub') === -1) continue;
+                    if (prefVoice === 'orig' && vLow.indexOf('оригинал') === -1 && vLow.indexOf('orig') === -1) continue;
+                }
+
+                out.push(r);
+            }
+
+            return FilterEngine.sort(out, StorageManager.getSortBy());
+        },
+
+        sort: function (list, sortBy) {
+            var prio = StorageManager.getPriorities();
+            var copy = list.slice(0);
+            copy.sort(function (a, b) {
+                if (sortBy === 'name') return String(a.sourceName).localeCompare(String(b.sourceName));
+                if (sortBy === 'quality') {
+                    if (a.qualityNum !== b.qualityNum) return b.qualityNum - a.qualityNum;
+                    return (a.latency || 99999) - (b.latency || 99999);
+                }
+                if (sortBy === 'speed') {
+                    return (a.latency || 99999) - (b.latency || 99999);
+                }
+                var pa = prio.indexOf(a.pluginId);
+                var pb = prio.indexOf(b.pluginId);
+                if (pa !== -1 && pb !== -1 && pa !== pb) return pa - pb;
+                if (pa !== -1 && pb === -1) return -1;
+                if (pb !== -1 && pa === -1) return 1;
+                if (a.qualityNum !== b.qualityNum) return b.qualityNum - a.qualityNum;
+                return String(a.sourceName).localeCompare(String(b.sourceName));
             });
             return copy;
-        },
-
-        countActiveFilters: function (filters) {
-            filters = filters || StorageManager.getFilters();
-            var c = 0;
-            if (filters.quality !== 'all') c++;
-            if (filters.contentType !== 'all') c++;
-            if (filters.pluginId !== 'all') c++;
-            if (filters.onlyWorking) c++;
-            if (filters.onlyFavorites) c++;
-            if (filters.only4k) c++;
-            if (filters.onlyFullHd) c++;
-            if (filters.onlyHDR) c++;
-            if (filters.onlyDV) c++;
-            if (filters.onlyTranslated) c++;
-            if (filters.onlySubtitles) c++;
-            if (filters.hideUnavailable) c++;
-            if (filters.sortBy !== 'priority') c++;
-            if (safeTrim(filters.searchQuery || '')) c++;
-            return c;
         }
     };
 
     // =========================================================================
-    // 9. ПРОВЕРКА ДОСТУПНОСТИ (HealthChecker)
-    // =========================================================================
-    var HealthChecker = {
-        CACHE_TTL_MS: 120000,
-
-        checkTarget: function (cacheKey, url, adapterCheckFn, force, callback) {
-            var self = this;
-            var cached = SourceRegistry.healthCache[cacheKey];
-            var now = Date.now();
-            if (!force && cached && cached.checkedAt && (now - cached.checkedAt) < self.CACHE_TTL_MS) {
-                if (callback) callback(cached);
-                return;
-            }
-
-            if (typeof adapterCheckFn === 'function') {
-                var startAd = Date.now();
-                var doneAd = false;
-                var timerAd = setTimeout(function () {
-                    if (doneAd) return;
-                    doneAd = true;
-                    var resT = { status: 'offline', latency: StorageManager.getTimeout(), checkedAt: Date.now(), message: 'Тайм-аут адаптера' };
-                    SourceRegistry.healthCache[cacheKey] = resT;
-                    if (callback) callback(resT);
-                }, StorageManager.getTimeout());
-
-                try {
-                    adapterCheckFn(function (ok, msg) {
-                        if (doneAd) return;
-                        doneAd = true;
-                        clearTimeout(timerAd);
-                        var res = { status: ok ? 'online' : 'offline', latency: Date.now() - startAd, checkedAt: Date.now(), message: msg || (ok ? 'Доступен' : 'Не отвечает') };
-                        SourceRegistry.healthCache[cacheKey] = res;
-                        if (callback) callback(res);
-                    });
-                } catch (eAd) {
-                    if (!doneAd) {
-                        doneAd = true;
-                        clearTimeout(timerAd);
-                        Diagnostics.logError('HealthChecker:' + cacheKey, eAd);
-                        var resErr = { status: 'offline', latency: 0, checkedAt: Date.now(), message: 'Ошибка адаптера' };
-                        SourceRegistry.healthCache[cacheKey] = resErr;
-                        if (callback) callback(resErr);
-                    }
-                }
-                return;
-            }
-
-            if (!url || String(url).indexOf('http') !== 0) {
-                var btnRes = { status: 'button_only', latency: 0, checkedAt: Date.now(), message: 'Кнопка плагина' };
-                SourceRegistry.healthCache[cacheKey] = btnRes;
-                if (callback) callback(btnRes);
-                return;
-            }
-
-            SourceRegistry.healthCache[cacheKey] = { status: 'checking', latency: 0, checkedAt: 0, message: 'Проверка...' };
-            var start = Date.now();
-            var done = false;
-            var timeoutMs = StorageManager.getTimeout();
-            var net = null;
-
-            try {
-                net = new Lampa.Reguest();
-                net.timeout(timeoutMs);
-            } catch (eNet) {
-                Diagnostics.logError('HealthChecker.net', eNet);
-                var fbRes = { status: 'button_only', latency: 0, checkedAt: Date.now(), message: 'Сетевая проверка недоступна' };
-                SourceRegistry.healthCache[cacheKey] = fbRes;
-                if (callback) callback(fbRes);
-                return;
-            }
-
-            var guard = setTimeout(function () {
-                if (done) return;
-                done = true;
-                try { net.clear(); } catch (eC) {}
-                var resT = { status: 'offline', latency: timeoutMs, checkedAt: Date.now(), message: 'Тайм-аут (' + Math.round(timeoutMs / 1000) + ' с)' };
-                SourceRegistry.healthCache[cacheKey] = resT;
-                if (callback) callback(resT);
-            }, timeoutMs + 300);
-
-            net.silent(
-                url,
-                function () {
-                    if (done) return;
-                    done = true;
-                    clearTimeout(guard);
-                    var lat = Date.now() - start;
-                    var resOk = { status: 'online', latency: lat, checkedAt: Date.now(), message: 'Доступен (' + lat + ' мс)' };
-                    SourceRegistry.healthCache[cacheKey] = resOk;
-                    if (callback) callback(resOk);
-                },
-                function () {
-                    if (done) return;
-                    done = true;
-                    clearTimeout(guard);
-                    var resFail = { status: 'offline', latency: Date.now() - start, checkedAt: Date.now(), message: 'Сервер недоступен' };
-                    SourceRegistry.healthCache[cacheKey] = resFail;
-                    if (callback) callback(resFail);
-                },
-                false,
-                { dataType: 'text' }
-            );
+    // 9. ЕДИНЫЙ ПАРАЛЛЕЛЬНЫЙ ПОИСК И КЕШ РЕЗУЛЬТАТОВ (UnifiedSearchEngine)
+    // =========================================================================    var SearchCache = {
+        TTL_MS: 300000, // 5 минут
+        store: {},
+        makeKey: function (meta, scopeId) {
+            return (meta.mediaType || 'movie') + ':' + (meta.tmdbId || meta.title) + ':' + (scopeId || 'all');
         },
-
-        checkPlugin: function (plugin, force, callback) {
-            if (!plugin) {
-                if (callback) callback({ status: 'unsupported', latency: 0, checkedAt: Date.now(), message: 'Не найден' });
-                return;
-            }
-            var checkFn = (plugin.customAdapter && typeof plugin.customAdapter.check === 'function') ? plugin.customAdapter.check : null;
-            HealthChecker.checkTarget(plugin.id, plugin.url, checkFn, force, callback);
+        get: function (meta, scopeId) {
+            var entry = SearchCache.store[SearchCache.makeKey(meta, scopeId)];
+            if (entry && (Date.now() - entry.savedAt) < SearchCache.TTL_MS) return entry.state;
+            return null;
         },
-
-        checkSource: function (src, force, callback) {
-            if (!src) {
-                if (callback) callback({ status: 'unsupported', latency: 0, checkedAt: Date.now(), message: 'Нет данных' });
-                return;
-            }
-            var checkFn = (src.adapter && typeof src.adapter.check === 'function') ? function (cb) { src.adapter.check(cb, src); } : null;
-            var targetUrl = src.url || (SourceRegistry.getPluginById(src.pluginId) ? SourceRegistry.getPluginById(src.pluginId).url : '');
-            HealthChecker.checkTarget(src.key, targetUrl, checkFn, force, callback);
+        set: function (meta, scopeId, state) {
+            SearchCache.store[SearchCache.makeKey(meta, scopeId)] = { savedAt: Date.now(), state: state };
         },
-
-        checkAll: function (force, onUpdate, onComplete) {
-            var plugins = SourceRegistry.getPlugins();
-            var total = plugins.length;
-            if (!total) { if (onComplete) onComplete(); return; }
-            var finished = 0;
-            var i;
-            for (i = 0; i < total; i++) {
-                (function (pl) {
-                    HealthChecker.checkPlugin(pl, force, function (res) {
-                        finished++;
-                        if (onUpdate) onUpdate(pl, res);
-                        if (finished >= total && onComplete) onComplete();
-                    });
-                })(plugins[i]);
-            }
+        clear: function (meta, scopeId) {
+            delete SearchCache.store[SearchCache.makeKey(meta, scopeId)];
         }
     };
 
-    // =========================================================================
-    // 10. РЕЖИМ «ЛУЧШИЙ ВЫБОР» (BestChoiceEngine)
-    // =========================================================================
-    var BestChoiceEngine = {
-        scoreResult: function (res, mediaMeta) {
-            if (!res || !res.canLaunch) return -1;
-            var qScore = FilterEngine.getQualityScore(res);
-            if (qScore <= 0) return -1;
-
-            var score = 1000;
-            score += BestChoiceEngine._computeMatchScore(res, mediaMeta);
-
-            if (mediaMeta && mediaMeta.isSeries) {
-                if (res.season && res.episode) score += 120;
-                else if (res.season) score += 60;
-            }
-
-            score += qScore;
-            if (res.qualities && res.qualities.hasDV === true) score += 35;
-            if (res.qualities && res.qualities.hasHDR === true) score += 25;
-
-            if (res.voice) {
-                score += 60;
-                var vLow = String(res.voice).toLowerCase();
-                if (vLow.indexOf('дубляж') !== -1 || vLow.indexOf('dub') !== -1 || vLow.indexOf('рус') !== -1 || vLow.indexOf('укр') !== -1) {
-                    score += 25;
-                }
-            }
-            if (res.hasSubtitles === true || res.subtitles) score += 15;
-
-            if (StorageManager.isFavorite(res.sourceKey) || StorageManager.isPluginFavorite(res.pluginId)) score += 50;
-            var prio = StorageManager.getPriorities();
-            var idx = prio.indexOf(res.sourceKey);
-            if (idx !== -1) score += Math.max(0, 30 - idx * 3);
-
-            if (typeof res.latency === 'number' && res.latency > 0) {
-                if (res.latency < 500) score += 15;
-                else if (res.latency < 1500) score += 10;
-                else if (res.latency < 3000) score += 5;
-            }
-            return score;
-        },
-
-        _computeMatchScore: function (res, mediaMeta) {
-            if (!mediaMeta) return 100;
-            var pts = 0;
-            var matchedTitle = String(res.matchedTitle || '').toLowerCase();
-            if (matchedTitle) {
-                var loc = String(mediaMeta.localizedTitle || '').toLowerCase();
-                var orig = String(mediaMeta.originalTitle || '').toLowerCase();
-                if ((loc && matchedTitle === loc) || (orig && matchedTitle === orig)) pts += 200;
-                else if ((loc && matchedTitle.indexOf(loc) !== -1) || (orig && matchedTitle.indexOf(orig) !== -1)) pts += 140;
-                else pts += 60;
-            } else if (res.matchedById) {
-                pts += 200;
-            } else {
-                pts += 100;
-            }
-            if (mediaMeta.year && res.year && String(res.year) === String(mediaMeta.year)) pts += 80;
-            return pts;
-        },
-
-        evaluate: function (results, mediaMeta) {
-            var scored = [];
-            var i;
-            for (i = 0; i < results.length; i++) {
-                var s = BestChoiceEngine.scoreResult(results[i], mediaMeta);
-                if (s > 0) scored.push({ result: results[i], score: s });
-            }
-            if (!scored.length) {
-                return { mode: 'none', best: null, candidates: [], reason: 'Нет результатов с подтверждённым запуском и известным качеством.' };
-            }
-            scored.sort(function (a, b) { return b.score - a.score; });
-
-            var topScore = scored[0].score;
-            var tied = [scored[0].result];
-            for (i = 1; i < scored.length; i++) {
-                if ((topScore - scored[i].score) <= 10) tied.push(scored[i].result);
-            }
-            if (tied.length > 1) {
-                return { mode: 'tie', best: null, candidates: tied, score: topScore, reason: 'Найдено ' + tied.length + ' равноценных лучших варианта.' };
-            }
-            return { mode: 'single', best: scored[0].result, candidates: [scored[0].result], score: topScore, reason: 'Выбран по реальному качеству, соответствию и подтверждённому запуску.' };
-        }
-    };
-
-    // =========================================================================
-    // 11. ЕДИНЫЙ ПОИСК ПО ОНЛАЙН-ПЛАГИНАМ (UnifiedSearchEngine)
-    // =========================================================================
     var UnifiedSearchEngine = {
+        activeSessionId: 0,
+        activeNetHandles: [],
+        activeTimers: [],
+
+        cancelActiveSearch: function () {
+            UnifiedSearchEngine.activeSessionId++;
+            var i;
+            for (i = 0; i < UnifiedSearchEngine.activeNetHandles.length; i++) {
+                try { UnifiedSearchEngine.activeNetHandles[i].clear(); } catch (e) {}
+            }
+            for (i = 0; i < UnifiedSearchEngine.activeTimers.length; i++) {
+                try { clearTimeout(UnifiedSearchEngine.activeTimers[i]); } catch (e2) {}
+            }
+            UnifiedSearchEngine.activeNetHandles = [];
+            UnifiedSearchEngine.activeTimers = [];
+            return UnifiedSearchEngine.activeSessionId;
+        },
+        _trackNet: function (net) { if (net) UnifiedSearchEngine.activeNetHandles.push(net); },
+        _trackTimer: function (t) { if (t) UnifiedSearchEngine.activeTimers.push(t); },
+
         /**
-         * options.pluginIds — опциональный список ID плагинов для ручного поиска.
+         * Параллельный поиск по всем разрешённым источникам (или по одному выбранному scopePluginId).
          */
-        searchAll: function (card, explicitMethod, buttonMap, callbacks, options) {
+        search: function (card, explicitMethod, scopePluginId, forceRefresh, callbacks) {
             callbacks = callbacks || {};
-            options = options || {};
-            var searchStartTs = Date.now();
             var mediaMeta = TitleResolver.extractMediaMeta(card, explicitMethod);
+            var scope = scopePluginId || 'all';
+
+            if (!forceRefresh) {
+                var cached = SearchCache.get(mediaMeta, scope);
+                if (cached) {
+                    if (callbacks.onComplete) callbacks.onComplete(cached);
+                    return cached;
+                }
+            } else {
+                SearchCache.clear(mediaMeta, scope);
+            }
+
+            var sessionId = UnifiedSearchEngine.cancelActiveSearch();
+            var t0 = Date.now();
             SourceRegistry.resetAndScan();
 
-            var plugins = SourceRegistry.getPlugins();
-            var activePlugins = [];
+            var allAdapters = SourceRegistry.getAdapters();
+            var targetAdapters = [];
             var i;
-            for (i = 0; i < plugins.length; i++) {
-                if (!StorageManager.isPluginEnabled(plugins[i].id)) continue;
-                if (options.pluginIds && Object.prototype.toString.call(options.pluginIds) === '[object Array]') {
-                    if (options.pluginIds.indexOf(plugins[i].id) === -1) continue;
-                }
-                activePlugins.push(plugins[i]);
+            for (i = 0; i < allAdapters.length; i++) {
+                var info = allAdapters[i].getSourceInfo();
+                // Строго не отправляем запросы отключённым источникам!
+                if (!StorageManager.isSourceEnabled(info.id)) continue;
+                if (scope !== 'all' && info.id !== scope) continue;
+                targetAdapters.push(allAdapters[i]);
             }
 
             var state = {
+                sessionId: sessionId,
                 mediaMeta: mediaMeta,
-                pluginStatuses: {},
+                scope: scope,
+                statusText: targetAdapters.length ? 'Поиск источников...' : 'Нет активных источников',
+                isSearching: targetAdapters.length > 0,
+                cancelled: false,
+                statuses: {},
                 results: [],
-                completedCount: 0,
-                totalPlugins: activePlugins.length,
+                completed: 0,
+                total: targetAdapters.length,
                 durationMs: 0
             };
 
-            if (!activePlugins.length) {
+            if (!targetAdapters.length) {
+                Diagnostics.lastSearchAt = Date.now();
                 Diagnostics.lastSearchDurationMs = 0;
+                Diagnostics.lastResultCount = 0;
                 if (callbacks.onComplete) callbacks.onComplete(state);
                 return state;
             }
 
-            for (i = 0; i < activePlugins.length; i++) {
-                var pl = activePlugins[i];
-                state.pluginStatuses[pl.id] = {
-                    plugin: pl,
-                    status: 'searching',
-                    label: 'Поиск...',
-                    count: 0,
-                    error: '',
-                    latency: 0
-                };
+            for (i = 0; i < targetAdapters.length; i++) {
+                var inf = targetAdapters[i].getSourceInfo();
+                state.statuses[inf.id] = { info: inf, status: 'searching', label: 'Поиск...', count: 0, error: '' };
             }
+            if (callbacks.onUpdate) callbacks.onUpdate(state);
 
-            if (callbacks.onStart) callbacks.onStart(state);
+            for (i = 0; i < targetAdapters.length; i++) {
+                (function (adapter) {
+                    var info = adapter.getSourceInfo();
+                    var searchFn = mediaMeta.isSeries ? adapter.searchSeries : adapter.searchMovie;
+                    searchFn(mediaMeta, { sessionId: sessionId }, function (outcome) {
+                        if (sessionId !== UnifiedSearchEngine.activeSessionId) return;
 
-            for (i = 0; i < activePlugins.length; i++) {
-                (function (plugin) {
-                    UnifiedSearchEngine.searchSinglePlugin(plugin, mediaMeta, buttonMap, function (outcome) {
-                        state.pluginStatuses[plugin.id] = {
-                            plugin: plugin,
+                        outcome = outcome || { status: 'error', error: 'Пустой ответ адаптера', results: [] };
+                        var list = outcome.results || [];
+                        state.statuses[info.id] = {
+                            info: info,
                             status: outcome.status,
-                            label: outcome.label,
-                            count: outcome.results.length,
-                            error: outcome.error || '',
-                            latency: outcome.latency || 0
+                            label: outcome.status === 'found' ? ('Найдено: ' + list.length)
+                                : (outcome.status === 'empty' ? 'Ничего не найдено'
+                                : (outcome.status === 'unsupported' ? 'Только кнопка плагина' : 'Ошибка')),
+                            count: list.length,
+                            error: outcome.error || ''
                         };
 
-                        if (outcome.results && outcome.results.length) {
-                            state.results = UnifiedSearchEngine.mergeAndDeduplicate(state.results, outcome.results);
+                        if (list.length) {
+                            state.results = UnifiedSearchEngine.deduplicate(state.results, list);
                         }
 
-                        state.completedCount++;
-                        state.durationMs = Date.now() - searchStartTs;
-                        if (callbacks.onPluginUpdate) callbacks.onPluginUpdate(state, plugin);
-                        if (state.completedCount >= state.totalPlugins) {
+                        state.completed++;
+                        state.durationMs = Date.now() - t0;
+                        state.statusText = state.completed < state.total
+                            ? ('Источник ' + info.name + ' завершил поиск (' + state.completed + '/' + state.total + ') • Найдено: ' + state.results.length)
+                            : ('Поиск завершён • Найдено вариантов: ' + state.results.length);
+
+                        if (state.completed >= state.total) {
+                            state.isSearching = false;
+                            Diagnostics.lastSearchAt = Date.now();
                             Diagnostics.lastSearchDurationMs = state.durationMs;
+                            Diagnostics.lastResultCount = state.results.length;
+                            SearchCache.set(mediaMeta, scope, state);
                             if (callbacks.onComplete) callbacks.onComplete(state);
+                        } else if (callbacks.onUpdate) {
+                            callbacks.onUpdate(state);
                         }
                     });
-                })(activePlugins[i]);
+                })(targetAdapters[i]);
             }
 
             return state;
         },
 
-        searchSinglePlugin: function (plugin, mediaMeta, buttonMap, callback) {
-            var start = Date.now();
-            var finished = false;
-            var finish = function (outcome) {
-                if (finished) return;
-                finished = true;
-                outcome.latency = Date.now() - start;
-                outcome.results = outcome.results || [];
-                callback(outcome);
-            };
-
-            // Не отправляем пустой запрос, если у карточки нет ни названия, ни ID
-            if ((!mediaMeta.queryVariants || !mediaMeta.queryVariants.length) && !mediaMeta.imdbId && !mediaMeta.kinopoiskId) {
-                finish({ status: 'error', label: 'Ошибка', results: [], error: 'У карточки отсутствуют название и идентификаторы' });
-                return;
-            }
-
-            if (plugin.customAdapter && typeof plugin.customAdapter.search === 'function') {
-                var timerAd = setTimeout(function () {
-                    Diagnostics.logError('Search:' + plugin.name, 'Тайм-аут адаптера');
-                    finish({ status: 'unavailable', label: 'Недоступен', results: [], error: 'Тайм-аут адаптера' });
-                }, StorageManager.getTimeout());
-
-                try {
-                    plugin.customAdapter.search(mediaMeta, mediaMeta.queryVariants, function (err, rawResults) {
-                        clearTimeout(timerAd);
-                        if (err) {
-                            Diagnostics.logError('Search:' + plugin.name, err);
-                            finish({ status: 'error', label: 'Ошибка', results: [], error: String(err) });
-                            return;
-                        }
-                        var normalized = UnifiedSearchEngine._normalizeAdapterResults(plugin, rawResults, Date.now() - start);
-                        finish({
-                            status: normalized.length ? 'found' : 'empty',
-                            label: normalized.length ? ('Найдено (' + normalized.length + ')') : 'Ничего не найдено',
-                            results: normalized
-                        });
-                    });
-                } catch (eAd) {
-                    clearTimeout(timerAd);
-                    Diagnostics.logError('Search:' + plugin.name, eAd);
-                    finish({ status: 'error', label: 'Ошибка', results: [], error: String(eAd && eAd.message ? eAd.message : eAd) });
-                }
-                return;
-            }
-
-            var origin = PluginAdapterEngine.extractOrigin(plugin.url);
-            if (origin && (plugin.adapterType === 'lampac_protocol' || plugin.adapterType === 'lampac_or_native')) {
-                UnifiedSearchEngine._searchLampacPlugin(plugin, origin, mediaMeta, finish);
-                return;
-            }
-
-            finish({
-                status: 'unsupported',
-                label: 'Не поддерживается',
-                results: [],
-                hasNativeButton: !!(buttonMap && buttonMap[plugin.id])
-            });
-        },
-
-        _searchLampacPlugin: function (plugin, origin, mediaMeta, callback) {
-            PluginAdapterEngine._probeLampacEvents(plugin, origin, function (balancers) {
-                if (!balancers || !balancers.length) {
-                    if (plugin.adapterType === 'lampac_or_native') {
-                        callback({ status: 'unsupported', label: 'Не поддерживается', results: [] });
-                    } else {
-                        callback({ status: 'unavailable', label: 'Недоступен', results: [], error: 'Сервер /lite/events не ответил' });
-                    }
-                    return;
-                }
-
-                var activeBalancers = balancers.slice(0, 6);
-                var collected = [];
-                var doneCount = 0;
-                var hadError = false;
-                var i;
-
-                for (i = 0; i < activeBalancers.length; i++) {
-                    (function (bal) {
-                        UnifiedSearchEngine._queryLampacBalancerSequential(plugin, bal, mediaMeta, 0, function (err, resList) {
-                            if (err) hadError = true;
-                            if (resList && resList.length) collected = collected.concat(resList);
-                            doneCount++;
-                            if (doneCount >= activeBalancers.length) {
-                                if (collected.length) callback({ status: 'found', label: 'Найдено (' + collected.length + ')', results: collected });
-                                else if (hadError) callback({ status: 'error', label: 'Ошибка', results: [], error: 'Ошибка опроса балансиров' });
-                                else callback({ status: 'empty', label: 'Ничего не найдено', results: [] });
-                            }
-                        });
-                    })(activeBalancers[i]);
-                }
-            });
-        },
-
-        _queryLampacBalancerSequential: function (plugin, bal, mediaMeta, variantIdx, callback) {
-            var variants = mediaMeta.queryVariants || [];
-            if (!bal.url || variantIdx >= Math.min(variants.length, 3)) {
-                callback(null, []);
-                return;
-            }
-
-            var variant = variants[variantIdx];
-            if (!variant || !variant.query) {
-                UnifiedSearchEngine._queryLampacBalancerSequential(plugin, bal, mediaMeta, variantIdx + 1, callback);
-                return;
-            }
-
-            var sep = bal.url.indexOf('?') === -1 ? '?' : '&';
-            var reqUrl = bal.url + sep +
-                'rjson=true' +
-                '&title=' + encodeURIComponent(variant.query) +
-                (mediaMeta.originalTitle ? '&original_title=' + encodeURIComponent(mediaMeta.originalTitle) : '') +
-                (mediaMeta.year ? '&year=' + encodeURIComponent(mediaMeta.year) : '') +
-                (mediaMeta.imdbId ? '&imdb_id=' + encodeURIComponent(mediaMeta.imdbId) : '') +
-                (mediaMeta.kinopoiskId ? '&kinopoisk_id=' + encodeURIComponent(mediaMeta.kinopoiskId) : '') +
-                '&serial=' + (mediaMeta.isSeries ? '1' : '0');
-
-            var net = null;
-            try {
-                net = new Lampa.Reguest();
-                net.timeout(StorageManager.getTimeout());
-            } catch (e) {
-                Diagnostics.logError('LampacSearch:' + bal.name, e);
-                callback('Lampa.Reguest недоступен', []);
-                return;
-            }
-
-            var start = Date.now();
-            var done = false;
-            var guard = setTimeout(function () {
-                if (done) return;
-                done = true;
-                try { net.clear(); } catch (eC) {}
-                callback('Тайм-аут', []);
-            }, StorageManager.getTimeout() + 250);
-
-            net.silent(
-                reqUrl,
-                function (resp) {
-                    if (done) return;
-                    done = true;
-                    clearTimeout(guard);
-                    var parsed = UnifiedSearchEngine._parseLampacSearchResponse(plugin, bal, mediaMeta, resp, Date.now() - start);
-                    if (parsed.length) callback(null, parsed);
-                    else UnifiedSearchEngine._queryLampacBalancerSequential(plugin, bal, mediaMeta, variantIdx + 1, callback);
-                },
-                function () {
-                    if (done) return;
-                    done = true;
-                    clearTimeout(guard);
-                    callback('Ошибка сети', []);
-                },
-                false,
-                { dataType: 'text' }
-            );
-        },
-
-        _parseLampacSearchResponse: function (plugin, bal, mediaMeta, rawResp, latency) {
+        /**
+         * Удаляет точные дубликаты, сохраняя разные озвучки, качества, форматы и источники.
+         */
+        deduplicate: function (existing, incoming) {
+            var seen = {};
             var out = [];
-            if (!rawResp) return out;
-            var data = rawResp;
-            if (typeof rawResp === 'string') {
-                try { data = JSON.parse(rawResp); } catch (e) { return out; }
-            }
-            var list = Object.prototype.toString.call(data) === '[object Array]'
-                ? data
-                : (data && Object.prototype.toString.call(data.data) === '[object Array]' ? data.data : null);
-
-            if (!list || !list.length) return out;
-
-            var i, item, streamUrl, qObj, maxQ;
-            for (i = 0; i < Math.min(list.length, 6); i++) {
-                item = list[i];
-                if (!item || typeof item !== 'object') continue;
-                streamUrl = item.url || item.file || item.stream || '';
-                maxQ = '';
-                if (!streamUrl && item.quality && typeof item.quality === 'object') {
-                    var qKey;
-                    for (qKey in item.quality) {
-                        if (item.quality.hasOwnProperty(qKey) && item.quality[qKey]) {
-                            streamUrl = item.quality[qKey];
-                            maxQ = qKey;
-                            break;
-                        }
-                    }
-                }
-                qObj = PluginAdapterEngine.parseQualityMetadata(item.maxquality || item.quality_label || maxQ || item.quality, item);
-                if (!qObj.has4k && !qObj.has1080p && !qObj.has720p && !qObj.hasSD) qObj = cloneObj(bal.qualities || {});
-
-                var voice = item.translate || item.voice || '';
-                var subs = item.subtitles || item.cc || '';
-
-                out.push({
-                    id: makeSafeId(plugin.id + '_' + bal.id + '_' + (item.title || i) + '_' + voice),
-                    key: bal.key,
-                    sourceKey: bal.key,
-                    pluginId: plugin.id,
-                    pluginName: plugin.name,
-                    sourceName: bal.name,
-                    name: bal.name,
-                    matchedTitle: item.title || item.name || mediaMeta.title,
-                    matchedById: !!(mediaMeta.imdbId || mediaMeta.kinopoiskId),
-                    year: item.year || mediaMeta.year || '',
-                    voice: voice,
-                    subtitles: subs,
-                    hasTranslation: !!voice,
-                    hasSubtitles: !!(subs && (typeof subs === 'string' ? subs.length : (subs.length > 0))),
-                    season: item.season || item.s || '',
-                    episode: item.episode || item.e || '',
-                    streamUrl: streamUrl,
-                    qualityMap: (item.quality && typeof item.quality === 'object') ? item.quality : null,
-                    qualities: qObj,
-                    contentTypes: { movies: !mediaMeta.isSeries, series: !!mediaMeta.isSeries },
-                    status: 'found',
-                    canLaunch: !!streamUrl,
-                    launchType: streamUrl ? 'direct_stream' : 'plugin_button',
-                    latency: latency,
-                    adapter: null
-                });
-            }
-            return out;
-        },
-
-        _normalizeAdapterResults: function (plugin, rawResults, latency) {
-            var out = [];
-            if (Object.prototype.toString.call(rawResults) !== '[object Array]') return out;
-            var i, r;
-            for (i = 0; i < rawResults.length; i++) {
-                r = rawResults[i];
-                if (!r || typeof r !== 'object') continue;
-                var srcId = makeSafeId(r.sourceId || r.sourceName || r.name || ('res_' + i));
-                var srcKey = plugin.id + '::' + srcId;
-                var voice = r.voice || '';
-                var subs = r.subtitles || '';
-                out.push({
-                    id: makeSafeId(srcKey + '_' + voice + '_' + (r.season || '') + '_' + (r.episode || '') + '_' + (r.streamUrl || '')),
-                    key: srcKey,
-                    sourceKey: srcKey,
-                    pluginId: plugin.id,
-                    pluginName: plugin.name,
-                    sourceName: r.sourceName || r.name || plugin.name,
-                    name: r.sourceName || r.name || plugin.name,
-                    matchedTitle: r.matchedTitle || r.title || '',
-                    matchedById: !!r.matchedById,
-                    year: r.year || '',
-                    voice: voice,
-                    subtitles: subs,
-                    hasTranslation: typeof r.hasTranslation === 'boolean' ? r.hasTranslation : !!voice,
-                    hasSubtitles: typeof r.hasSubtitles === 'boolean' ? r.hasSubtitles : !!subs,
-                    season: r.season || '',
-                    episode: r.episode || '',
-                    streamUrl: r.streamUrl || r.url || '',
-                    qualityMap: r.qualityMap || null,
-                    qualities: PluginAdapterEngine.parseQualityMetadata(r.qualities || r.quality, r),
-                    contentTypes: r.contentTypes || {},
-                    status: 'found',
-                    canLaunch: typeof r.canLaunch === 'boolean' ? r.canLaunch : !!(r.streamUrl || r.url || (plugin.customAdapter && typeof plugin.customAdapter.open === 'function')),
-                    launchType: (r.streamUrl || r.url) ? 'direct_stream' : 'direct_adapter',
-                    latency: typeof r.latency === 'number' ? r.latency : latency,
-                    adapter: plugin.customAdapter || null,
-                    rawResult: r
-                });
-            }
-            return out;
-        },
-
-        mergeAndDeduplicate: function (existing, incoming) {
-            var map = {};
-            var out = [];
-            var combined = (existing || []).concat(incoming || []);
-            var i, r, cleanUrl, sig;
-            for (i = 0; i < combined.length; i++) {
-                r = combined[i];
-                cleanUrl = safeTrim(String(r.streamUrl || ''));
-                sig = cleanUrl
-                    ? ('url|' + cleanUrl)
-                    : [
-                        r.pluginId,
-                        String(r.sourceName || '').toLowerCase(),
-                        FilterEngine.getQualityLabel(r),
-                        String(r.voice || '').toLowerCase(),
-                        String(r.season || ''),
-                        String(r.episode || '')
-                    ].join('|');
-                if (!map[sig]) {
-                    map[sig] = true;
+            var all = (existing || []).concat(incoming || []);
+            var i, r, sig;
+            for (i = 0; i < all.length; i++) {
+                r = all[i];
+                sig = [
+                    r.pluginId,
+                    String(r.sourceName || '').toLowerCase(),
+                    String(r.qualityNum || 0),
+                    String(r.voice || '').toLowerCase(),
+                    String(r.langCode || ''),
+                    String(r.format || '').toLowerCase(),
+                    String(r.season || ''),
+                    String(r.episode || ''),
+                    safeTrim(r.streamUrl)
+                ].join('|');
+                if (!seen[sig]) {
+                    seen[sig] = true;
                     out.push(r);
                 }
             }
             return out;
         },
 
-        launchResult: function (res, mediaMeta, buttonMap) {
-            if (!res) return false;
-            try {
-                if (res.launchType === 'direct_stream' && res.streamUrl && Lampa.Player && typeof Lampa.Player.play === 'function') {
-                    var playTitle = (mediaMeta && mediaMeta.title ? mediaMeta.title : res.matchedTitle || res.sourceName);
-                    if (res.season && res.episode) playTitle += ' • S' + res.season + 'E' + res.episode;
-                    Lampa.Player.play({
-                        url: res.streamUrl,
-                        title: playTitle,
-                        quality: res.qualityMap || undefined,
-                        subtitles: res.subtitles || undefined
+        checkAllSources: function (onEach, onDone) {
+            SourceRegistry.resetAndScan();
+            var adapters = SourceRegistry.getAdapters();
+            var total = adapters.length;
+            if (!total) { if (onDone) onDone({}); return; }
+            var finished = 0;
+            var results = {};
+            var i;
+            for (i = 0; i < total; i++) {
+                (function (ad) {
+                    var info = ad.getSourceInfo();
+                    ad.isAvailable(function (ok, msg, latency) {
+                        var rec = { id: info.id, name: info.name, ok: !!ok, message: msg || '', latency: latency || 0, checkedAt: Date.now() };
+                        results[info.id] = rec;
+                        Diagnostics.lastCheckResults[info.id] = rec;
+                        finished++;
+                        if (onEach) onEach(rec);
+                        if (finished >= total && onDone) onDone(results);
                     });
-                    return true;
-                }
-
-                if (res.adapter && typeof res.adapter.open === 'function') {
-                    res.adapter.open(mediaMeta ? mediaMeta.rawCard : {}, function () {}, res);
-                    return true;
-                }
-
-                var btnRec = buttonMap ? buttonMap[res.pluginId] : null;
-                if (btnRec && btnRec.element && btnRec.element.length) {
-                    if (Lampa.Noty) Lampa.Noty.show('ANDRPROD → ' + res.pluginName);
-                    btnRec.element.trigger('hover:enter');
-                    return true;
-                }
-            } catch (err) {
-                Diagnostics.logError('UnifiedSearchEngine.launch', err);
+                })(adapters[i]);
             }
-            if (Lampa.Noty) Lampa.Noty.show('ANDRPROD: Невозможно запустить «' + res.sourceName + '» — нет потока и кнопки плагина.');
-            return false;
         }
     };
 
     // =========================================================================
-    // 12. ИНТЕГРАЦИЯ С КАРТОЧКОЙ ФИЛЬМА / СЕРИАЛА (CardIntegration)
+    // 10. КАРТОЧКА ФИЛЬМА/СЕРИАЛА И ФИКС ПОВТОРНОГО НАЖАТИЯ (CardIntegration)
     // =========================================================================
     var CardIntegration = {
         initialized: false,
         lastMovie: null,
         lastMethod: '',
-        lastButtonMap: {},
 
         init: function () {
-            if (CardIntegration.initialized) return true;
+            if (CardIntegration.initialized) return;
             if (!Lampa.Listener || typeof Lampa.Listener.follow !== 'function') {
-                Diagnostics.logError('CardIntegration', 'Lampa.Listener.follow недоступен; повторная попытка будет выполнена при запуске');
-                return false;
+                Diagnostics.logError('CardIntegration', 'Lampa.Listener.follow недоступен');
+                return;
             }
-            try {
-                Lampa.Listener.follow('full', function (e) {
-                    if (e && (e.type === 'complite' || e.type === 'complete')) {
-                        Diagnostics.lastCardEventAt = Date.now();
-                        try {
-                            CardIntegration.attachToCard(e);
-                        } catch (err) {
-                            Diagnostics.logError('CardIntegration.attach', err);
-                        }
-                    }
-                });
-                CardIntegration.initialized = true;
-                Diagnostics.cardIntegrationActive = true;
-                return true;
-            } catch (err) {
-                Diagnostics.logError('CardIntegration.listen', err);
-                return false;
-            }
+            CardIntegration.initialized = true;
+            Diagnostics.cardIntegrationActive = true;
+
+            Lampa.Listener.follow('full', function (e) {
+                if (e && e.type === 'complite') {
+                    Diagnostics.lastCardEventAt = Date.now();
+                    try { CardIntegration.attachToCard(e); }
+                    catch (err) { Diagnostics.logError('CardIntegration.attach', err); }
+                }
+            });
         },
 
         attachToCard: function (event) {
@@ -2043,12 +1229,11 @@
                 : null;
             if (!render || !render.length) return;
 
-            var buttonsContainer = render.find('.full-start-new__buttons');
-            if (!buttonsContainer.length) buttonsContainer = render.find('.full-start__buttons');
-            if (!buttonsContainer.length) return;
+            var container = render.find('.full-start-new__buttons');
+            if (!container.length) container = render.find('.full-start__buttons');
+            if (!container.length) return;
 
-            // Гарантия отсутствия дублей кнопок и обработчиков при повторном открытии карточки
-            buttonsContainer.find('.andrprod-card-btn').off('hover:enter').remove();
+            container.find('.andrprod-card-btn').off('hover:enter').remove();
 
             var movie = (event.data && event.data.movie) ? event.data.movie : (event.object && event.object.card ? event.object.card : {});
             var method = (event.object && event.object.method) ? event.object.method : '';
@@ -2060,341 +1245,269 @@
                     BrandIcons.getLogoSvg('andrprod-card-btn__logo', 'card_' + (movie.id || '0')) +
                 '</div>'
             );
-
-            buttonsContainer.prepend(btn);
-
-            setTimeout(function () {
-                try { CardIntegration.collectCardButtons(buttonsContainer); } catch (e) { Diagnostics.logError('CardIntegration.collect', e); }
-            }, 350);
+            container.prepend(btn);
 
             btn.on('hover:enter', function () {
-                CardIntegration.collectCardButtons(buttonsContainer);
                 Lampa.Activity.push({
                     url: '',
-                    title: 'ANDRPROD',
+                    title: PLUGIN_NAME,
                     component: SEARCH_COMPONENT,
                     movie: movie,
                     method: method,
+                    scope: 'all',
                     page: 1
                 });
             });
         },
 
-        collectCardButtons: function (buttonsContainer) {
-            var map = {};
-            if (!buttonsContainer || !buttonsContainer.length) return map;
-
-            buttonsContainer.find('.full-start__button').each(function () {
-                var el = $(this);
-                var cls = String(el.attr('class') || '');
-                var i;
-                for (i = 0; i < IGNORED_BUTTON_CLASSES.length; i++) {
-                    if (cls.indexOf(IGNORED_BUTTON_CLASSES[i]) !== -1) return;
-                }
-                var label = safeTrim(el.find('span').text() || el.text() || '');
-                if (!label) return;
-                var lowerLabel = label.toLowerCase();
-                var lowerCls = cls.toLowerCase();
-                if (lowerLabel.indexOf('трейлер') !== -1 || lowerLabel.indexOf('trailer') !== -1 || lowerLabel.indexOf('закладк') !== -1 || lowerLabel.indexOf('подпис') !== -1 || lowerLabel.indexOf('торрент') !== -1 || lowerLabel.indexOf('torrent') !== -1) {
-                    return;
-                }
-                // Привязываем кнопку только к подтверждённым онлайн-плагинам из белого списка
-                var matchedId = CardIntegration._matchButtonToOnlinePluginId(lowerLabel, lowerCls);
-                if (matchedId) {
-                    map[matchedId] = { id: matchedId, name: label, element: el };
-                }
-            });
-
-            CardIntegration.lastButtonMap = map;
-            return map;
-        },
-
-        _matchButtonToOnlinePluginId: function (lowerLabel, lowerCls) {
-            var i, j, prof;
+        /**
+         * ИСПРАВЛЕНИЕ БАГА ПОВТОРНОГО НАЖАТИЯ (Раздел 9):
+         * Всегда ищет ЖИВУЮ прикреплённую кнопку в активном DOM карточки фильма/сериала.
+         * Если открыт экран ANDRPROD поверх карточки — сначала безопасно возвращается
+         * в карточку через Lampa.Activity.backward(), затем нажимает живую кнопку плагина.
+         */
+        launchPluginLiveButton: function (pluginId) {
+            var prof = null;
+            var i;
             for (i = 0; i < ONLINE_PLUGIN_WHITELIST.length; i++) {
-                prof = ONLINE_PLUGIN_WHITELIST[i];
-                for (j = 0; j < prof.buttonHints.length; j++) {
-                    var hint = prof.buttonHints[j];
-                    if (lowerLabel.indexOf(hint) !== -1 || lowerCls.indexOf(hint) !== -1) return prof.id;
-                }
+                if (ONLINE_PLUGIN_WHITELIST[i].id === pluginId) { prof = ONLINE_PLUGIN_WHITELIST[i]; break; }
             }
-            return null;
-        },
+            var hints = prof ? prof.buttonHints : [pluginId];
 
-        launchPluginNativeButton: function (pluginId) {
-            var rec = CardIntegration.lastButtonMap ? CardIntegration.lastButtonMap[pluginId] : null;
-            if (rec && rec.element && rec.element.length) {
-                if (Lampa.Noty) Lampa.Noty.show('ANDRPROD → ' + rec.name);
-                rec.element.trigger('hover:enter');
-                return true;
+            function findAndTriggerLive() {
+                var btns = $('.full-start-new__buttons .full-start__button, .full-start__buttons .full-start__button');
+                var matchedEl = null;
+                btns.each(function () {
+                    if (matchedEl) return;
+                    var el = $(this);
+                    if (el.hasClass('andrprod-card-btn')) return;
+                    var txt = safeTrim(el.find('span').text() || el.text()).toLowerCase();
+                    var cls = String(el.attr('class') || '').toLowerCase();
+                    var h;
+                    for (h = 0; h < hints.length; h++) {
+                        if (txt.indexOf(hints[h]) !== -1 || cls.indexOf(hints[h]) !== -1) {
+                            matchedEl = el;
+                            return;
+                        }
+                    }
+                });
+                if (matchedEl && matchedEl.length) {
+                    if (Lampa.Noty) Lampa.Noty.show(PLUGIN_NAME + ' → ' + (prof ? prof.name : pluginId));
+                    matchedEl.trigger('hover:enter');
+                    return true;
+                }
+                return false;
+            }
+
+            if (findAndTriggerLive()) return true;
+
+            // Если находимся на экране ANDRPROD поверх карточки — возвращаемся в карточку и нажимаем живую кнопку
+            try {
+                if (Lampa.Activity && typeof Lampa.Activity.backward === 'function') {
+                    Lampa.Activity.backward();
+                    setTimeout(function () {
+                        if (!findAndTriggerLive() && Lampa.Noty) {
+                            Lampa.Noty.show(PLUGIN_NAME + ': Кнопка плагина «' + (prof ? prof.name : pluginId) + '» не найдена в карточке.');
+                        }
+                    }, 180);
+                    return true;
+                }
+            } catch (e) {
+                Diagnostics.logError('CardIntegration.liveButton', e);
             }
             return false;
         }
     };
 
     // =========================================================================
-    // 13. ЭКРАН ЕДИНОГО ПОИСКА В КАРТОЧКЕ ФИЛЬМА/СЕРИАЛА (AndrprodSearchComponent)
+    // 11. ГЛАВНЫЙ ЭКРАН АГРЕГАТОРА (AndrprodSearchComponent)
     // =========================================================================
     function AndrprodSearchComponent(object) {
         var movie = (object && object.movie) ? object.movie : (CardIntegration.lastMovie || {});
         var method = (object && object.method) ? object.method : (CardIntegration.lastMethod || '');
+        var scope = (object && object.scope) ? object.scope : 'all';
         var mediaMeta = TitleResolver.extractMediaMeta(movie, method);
-        var buttonMap = CardIntegration.lastButtonMap || {};
 
         var scroll = new Lampa.Scroll({ mask: true, over: true });
-        var html = $('<div class="andrprod-hub andrprod-search-screen"></div>');
+        var html = $('<div class="andrprod-hub"></div>');
+        var headerEl = null;
+        var statusEl = null;
         var bodyEl = null;
         var lastFocused = null;
-        var searchState = null;
+        var state = null;
         var isDestroyed = false;
 
         this.create = function () {
-            SourceRegistry.resetAndScan();
-            buildAndRender();
-            var mode = StorageManager.getMode();
-            if (mode === 'auto' || mode === 'best') {
-                runUnifiedSearch(null);
+            buildShell();
+            if (StorageManager.getSearchMode() !== 'manual') {
+                startSearch(false);
+            } else {
+                renderBody();
             }
             return this.render();
         };
 
-        function runUnifiedSearch(selectedIds) {
-            searchState = UnifiedSearchEngine.searchAll(movie, method, buttonMap, {
-                onStart: function () { if (!isDestroyed) renderBody(true); },
-                onPluginUpdate: function () { if (!isDestroyed) renderBody(true); },
-                onComplete: function () { if (!isDestroyed) renderBody(true); }
-            }, selectedIds ? { pluginIds: selectedIds } : {});
+        function startSearch(forceRefresh) {
+            state = UnifiedSearchEngine.search(movie, method, scope, forceRefresh, {
+                onUpdate: function (st) { if (!isDestroyed) { state = st; renderStatusAndBody(true); } },
+                onComplete: function (st) { if (!isDestroyed) { state = st; renderStatusAndBody(true); } }
+            });
+            renderStatusAndBody(false);
         }
 
-        function openManualPluginPicker() {
-            var plugins = SourceRegistry.getPlugins();
-            if (!plugins.length) {
-                if (Lampa.Noty) Lampa.Noty.show('ANDRPROD: Не найдено установленных онлайн-плагинов.');
-                return;
-            }
-            var items = [{ title: '▶ Запустить поиск по выбранным плагинам', action: 'run' }];
+        function buildShell() {
+            html.empty();
+            var posterStyle = mediaMeta.poster ? ('background-image:url(\'' + mediaMeta.poster + '\')') : '';
+            headerEl = $(
+                '<div class="andrprod-hero">' +
+                    '<div class="andrprod-hero__poster" style="' + posterStyle + '"></div>' +
+                    '<div class="andrprod-hero__info">' +
+                        BrandIcons.getLogoSvg('andrprod-hero__logo', 'search') +
+                        '<div class="andrprod-hero__title">' + escapeHtml(mediaMeta.title) + (mediaMeta.year ? ' (' + escapeHtml(mediaMeta.year) + ')' : '') + '</div>' +
+                        '<div class="andrprod-hero__meta">' +
+                            (mediaMeta.isSeries ? 'Сериал' : 'Фильм') +
+                            (mediaMeta.originalTitle && mediaMeta.originalTitle !== mediaMeta.title ? ' • ' + escapeHtml(mediaMeta.originalTitle) : '') +
+                            (mediaMeta.rating ? ' • ★ ' + escapeHtml(mediaMeta.rating) : '') +
+                            (mediaMeta.numberOfSeasons ? ' • Сезонов: ' + mediaMeta.numberOfSeasons : '') +
+                        '</div>' +
+                        '<div class="andrprod-hero__status"></div>' +
+                        '<div class="andrprod-hero__actions">' +
+                            '<div class="andrprod-pill selector andrprod-act-search">Обновить поиск</div>' +
+                            '<div class="andrprod-pill selector andrprod-act-cancel">Отменить поиск</div>' +
+                            '<div class="andrprod-pill selector andrprod-act-scope">Источник: ' + escapeHtml(getScopeName(scope)) + '</div>' +
+                            '<div class="andrprod-pill selector andrprod-act-sources">Выбрать источники</div>' +
+                            '<div class="andrprod-pill selector andrprod-act-diag">Диагностика</div>' +
+                        '</div>' +
+                    '</div>' +
+                '</div>'
+            );
+
+            statusEl = headerEl.find('.andrprod-hero__status');
+            headerEl.find('.andrprod-act-search').on('hover:enter', function () { startSearch(true); });
+            headerEl.find('.andrprod-act-cancel').on('hover:enter', function () {
+                UnifiedSearchEngine.cancelActiveSearch();
+                if (state) { state.isSearching = false; state.cancelled = true; state.statusText = 'Поиск отменён пользователем'; }
+                renderStatusAndBody(true);
+            });
+            headerEl.find('.andrprod-act-scope').on('hover:enter', openScopePicker);
+            headerEl.find('.andrprod-act-sources').on('hover:enter', function () { HubLauncher.open({ view: 'sources' }); });
+            headerEl.find('.andrprod-act-diag').on('hover:enter', function () { HubLauncher.open({ view: 'diagnostics' }); });
+
+            bodyEl = $('<div class="andrprod-hub__body"></div>');
+            scroll.append(bodyEl);
+            html.append(headerEl);
+            html.append(scroll.render());
+        }
+
+        function openScopePicker() {
+            SourceRegistry.resetAndScan();
+            var adapters = SourceRegistry.getAdapters();
+            var items = [{ title: 'Все источники (общий поиск)', id: 'all', selected: scope === 'all' }];
             var i;
-            for (i = 0; i < plugins.length; i++) {
-                var sel = StorageManager.isSelectedForManualSearch(plugins[i].id);
-                items.push({
-                    title: (sel ? '[✓] ' : '[ ] ') + plugins[i].name,
-                    subtitle: sel ? 'Участвует в поиске' : 'Пропущен',
-                    action: 'toggle',
-                    pluginId: plugins[i].id
-                });
+            for (i = 0; i < adapters.length; i++) {
+                var inf = adapters[i].getSourceInfo();
+                if (!StorageManager.isSourceEnabled(inf.id)) continue;
+                items.push({ title: 'Только ' + inf.name, id: inf.id, selected: scope === inf.id });
             }
             Lampa.Select.show({
-                title: 'Ручной поиск — выбор онлайн-плагинов',
+                title: 'Где искать',
                 items: items,
                 onSelect: function (item) {
-                    if (item.action === 'toggle') {
-                        StorageManager.toggleManualSelection(item.pluginId);
-                        openManualPluginPicker();
-                        return;
-                    }
-                    if (item.action === 'run') {
-                        var chosen = [];
-                        var j;
-                        for (j = 0; j < plugins.length; j++) {
-                            if (StorageManager.isSelectedForManualSearch(plugins[j].id)) chosen.push(plugins[j].id);
-                        }
-                        Lampa.Controller.toggle('content');
-                        runUnifiedSearch(chosen);
-                    }
+                    scope = item.id;
+                    headerEl.find('.andrprod-act-scope').text('Источник: ' + getScopeName(scope));
+                    Lampa.Controller.toggle('content');
+                    startSearch(false);
                 },
                 onBack: function () { Lampa.Controller.toggle('content'); }
             });
         }
 
-        function retrySinglePlugin(plugin) {
-            if (!searchState) return;
-            searchState.pluginStatuses[plugin.id] = { plugin: plugin, status: 'searching', label: 'Поиск...', count: 0, error: '', latency: 0 };
-            renderBody(true);
-
-            UnifiedSearchEngine.searchSinglePlugin(plugin, mediaMeta, buttonMap, function (outcome) {
-                if (isDestroyed) return;
-                searchState.pluginStatuses[plugin.id] = {
-                    plugin: plugin,
-                    status: outcome.status,
-                    label: outcome.label,
-                    count: outcome.results.length,
-                    error: outcome.error || '',
-                    latency: outcome.latency || 0
-                };
-                if (outcome.results && outcome.results.length) {
-                    searchState.results = UnifiedSearchEngine.mergeAndDeduplicate(searchState.results, outcome.results);
-                }
-                renderBody(true);
-            });
-        }
-
-        function buildAndRender() {
-            html.empty();
-            var mode = StorageManager.getMode();
-            var modeLabel = mode === 'auto' ? 'Автоматический' : (mode === 'best' ? 'Лучший выбор' : 'Ручной');
-            var variantsText = [];
-            var i;
-            for (i = 0; i < Math.min(mediaMeta.queryVariants.length, 3); i++) variantsText.push(mediaMeta.queryVariants[i].query);
-
-            var header = $(
-                '<div class="andrprod-hub__header">' +
-                    '<div class="andrprod-hub__brand">' +
-                        BrandIcons.getLogoSvg('andrprod-hub__logo', 'search') +
-                        '<div class="andrprod-search-title">' +
-                            escapeHtml(mediaMeta.title || 'Выбранный контент') +
-                            (mediaMeta.year ? ' (' + escapeHtml(mediaMeta.year) + ')' : '') +
-                            ' • ' + (mediaMeta.isSeries ? 'Сериал' : 'Фильм') +
-                        '</div>' +
-                        '<div class="andrprod-hub__stats">Запросы: ' + escapeHtml(variantsText.join(' / ') || 'По ID') + '</div>' +
-                    '</div>' +
-                    '<div class="andrprod-hub__toolbar">' +
-                        '<div class="andrprod-pill selector andrprod-run-search">' + (mode === 'manual' ? 'Выбрать плагины и искать' : 'Найти источники') + '</div>' +
-                        '<div class="andrprod-pill selector andrprod-cycle-mode">Режим: ' + modeLabel + '</div>' +
-                        '<div class="andrprod-pill selector andrprod-open-filters">Фильтры (' + FilterEngine.countActiveFilters() + ')</div>' +
-                        '<div class="andrprod-pill selector andrprod-open-hub">Каталог</div>' +
-                    '</div>' +
-                '</div>'
-            );
-
-            header.find('.andrprod-run-search').on('hover:enter', function () {
-                if (StorageManager.getMode() === 'manual') openManualPluginPicker();
-                else runUnifiedSearch(null);
-            });
-            header.find('.andrprod-cycle-mode').on('hover:enter', function () {
-                var cur = StorageManager.getMode();
-                var next = cur === 'manual' ? 'auto' : (cur === 'auto' ? 'best' : 'manual');
-                StorageManager.setMode(next);
-                buildAndRender();
-                if (next === 'auto' || next === 'best') runUnifiedSearch(null);
-            });
-            header.find('.andrprod-open-filters').on('hover:enter', function () {
-                openSharedFiltersMenu(function () { buildAndRender(); });
-            });
-            header.find('.andrprod-open-hub').on('hover:enter', function () {
-                HubLauncher.open({ view: 'home' });
-            });
-
-            bodyEl = $('<div class="andrprod-hub__body"></div>');
-            scroll.append(bodyEl);
-            html.append(header);
-            html.append(scroll.render());
-            renderBody(false);
+        function renderStatusAndBody(preserveFocus) {
+            if (statusEl) {
+                if (!state) statusEl.text('Нажмите «Обновить поиск» для запуска (ручной режим)');
+                else statusEl.text(state.statusText + (state.durationMs ? (' • ' + state.durationMs + ' мс') : ''));
+            }
+            renderBody(preserveFocus);
         }
 
         function renderBody(preserveFocus) {
             if (isDestroyed || !bodyEl) return;
             bodyEl.empty();
 
-            // 1. Установленные онлайн-плагины для быстрого перехода к их источникам
-            var installedOnline = SourceRegistry.getPlugins();
-            bodyEl.append('<div class="andrprod-section-title">Установленные онлайн-плагины (' + installedOnline.length + ')</div>');
+            var rawResults = state ? state.results : [];
+            var filtered = FilterEngine.apply(rawResults);
 
-            if (!installedOnline.length) {
-                bodyEl.append('<div class="andrprod-empty"><div class="andrprod-empty__title">Подтверждённые онлайн-плагины не обнаружены</div><div class="andrprod-empty__desc">Установите онлайн-плагин (Alpaca, Lampac, Online Mod, Lumio, BWA и др.) в Настройки → Расширения Lampa.</div></div>');
-            } else {
-                var pGrid = $('<div class="andrprod-plugin-grid"></div>');
-                var pIdx;
-                for (pIdx = 0; pIdx < installedOnline.length; pIdx++) {
-                    (function (pl) {
-                        var st = (searchState && searchState.pluginStatuses[pl.id]) ? searchState.pluginStatuses[pl.id] : null;
-                        var srcs = SourceRegistry.getPluginSources(pl.id);
-                        var hasBtn = !!(buttonMap && buttonMap[pl.id]);
-                        var statusLabel = st ? st.label : (hasBtn ? 'Кнопка готова' : 'Открыть источники');
+            bodyEl.append('<div class="andrprod-section-title">Найденные варианты (' + filtered.length + (rawResults.length !== filtered.length ? (' из ' + rawResults.length) : '') + ')</div>');
+
+            if (filtered.length) {
+                var list = $('<div class="andrprod-source-list"></div>');
+                var i;
+                for (i = 0; i < filtered.length; i++) {
+                    (function (res) {
                         var card = $(
-                            '<div class="andrprod-plugin-card selector">' +
-                                '<div class="andrprod-plugin-card__top">' +
-                                    BrandIcons.getPluginIconHtml(pl) +
-                                    '<div class="andrprod-plugin-card__info">' +
-                                        '<div class="andrprod-plugin-card__name">' + escapeHtml(pl.name) + '</div>' +
-                                        '<div class="andrprod-plugin-card__count">Источников: <b>' + srcs.length + '</b></div>' +
+                            '<div class="andrprod-source-card selector">' +
+                                '<div class="andrprod-source-card__main">' +
+                                    '<div class="andrprod-source-card__header">' +
+                                        '<span class="andrprod-plugin-tag">' + escapeHtml(res.pluginName) + '</span>' +
+                                        '<span class="andrprod-source-card__title">' + escapeHtml(res.sourceName) + '</span>' +
+                                        '<span class="andrprod-chip"><b>' + escapeHtml(res.qualityLabel) + '</b></span>' +
+                                        (res.format ? '<span class="andrprod-chip">' + escapeHtml(res.format) + '</span>' : '') +
+                                    '</div>' +
+                                    '<div class="andrprod-chips-row">' +
+                                        (res.voice ? '<span class="andrprod-chip">Озвучка: <b>' + escapeHtml(res.voice) + '</b></span>' : '') +
+                                        '<span class="andrprod-chip">Язык: <b>' + escapeHtml(res.langLabel) + '</b></span>' +
+                                        (res.hasSubtitles ? '<span class="andrprod-chip">Субтитры: <b class="is-yes">Да</b></span>' : '') +
+                                        (res.season ? '<span class="andrprod-chip">S' + escapeHtml(res.season) + (res.episode ? 'E' + escapeHtml(res.episode) : '') + '</span>' : '') +
+                                        '<span class="andrprod-chip">Воспроизведение: <b class="' + (res.canPlay ? 'is-yes' : 'is-unk') + '">' + (res.canPlay ? 'Доступно' : 'Через плагин') + '</b></span>' +
                                     '</div>' +
                                 '</div>' +
-                                '<div class="andrprod-plugin-card__bottom">' +
-                                    '<div class="andrprod-status-line"><span class="andrprod-status-dot ' + (st ? mapSearchStatusDot(st.status) : (hasBtn ? 'is-ready' : 'is-unknown')) + '"></span><span>' + escapeHtml(statusLabel) + '</span></div>' +
-                                    '<div class="andrprod-open-cta">' + (hasBtn && srcs.length <= 1 ? 'Запустить ▶' : 'Открыть →') + '</div>' +
-                                '</div>' +
+                                '<div class="andrprod-source-card__right"><span class="andrprod-badge is-on">▶ Смотреть</span></div>' +
                             '</div>'
                         );
                         card.on('hover:enter', function () {
-                            if (srcs.length > 1 || !hasBtn) {
-                                HubLauncher.open({ view: 'plugin', pluginId: pl.id });
-                            } else {
-                                CardIntegration.launchPluginNativeButton(pl.id);
-                            }
+                            var ad = SourceRegistry.getAdapterById(res.pluginId);
+                            if (ad && typeof ad.play === 'function') ad.play(res, mediaMeta);
+                            else launchPlaybackSafe(res, mediaMeta);
                         });
                         card.on('hover:focus', function () { lastFocused = card[0]; scroll.update(card, true); });
-                        pGrid.append(card);
-                    })(installedOnline[pIdx]);
+                        list.append(card);
+                    })(filtered[i]);
                 }
-                bodyEl.append(pGrid);
-            }
-
-            if (!searchState) {
-                Lampa.Controller.collectionSet(html);
-                if (!preserveFocus) {
-                    var first0 = html.find('.selector')[0];
-                    if (first0) Lampa.Controller.collectionFocus(first0, html);
-                }
-                return;
-            }
-
-            // 2. Лучший выбор
-            if (StorageManager.isBestChoice() && searchState.results.length) {
-                var evalRes = BestChoiceEngine.evaluate(searchState.results, mediaMeta);
-                if (evalRes.mode === 'single' && evalRes.best) {
-                    bodyEl.append('<div class="andrprod-section-title">★ Лучший выбор ANDRPROD</div>');
-                    bodyEl.append(buildResultCard(evalRes.best, true));
-                } else if (evalRes.mode === 'tie') {
-                    bodyEl.append('<div class="andrprod-section-title">★ Равноценные лучшие варианты (' + evalRes.candidates.length + ')</div>');
-                    var t;
-                    for (t = 0; t < evalRes.candidates.length; t++) bodyEl.append(buildResultCard(evalRes.candidates[t], true));
-                } else {
-                    bodyEl.append('<div class="andrprod-info-bar"><span>Лучший выбор: ' + escapeHtml(evalRes.reason) + '</span></div>');
-                }
-            }
-
-            // 3. Единый список результатов
-            var filteredResults = FilterEngine.apply(searchState.results, StorageManager.getFilters());
-            bodyEl.append('<div class="andrprod-section-title">Найденные результаты (' + filteredResults.length + ') • ' + searchState.durationMs + ' мс</div>');
-
-            if (filteredResults.length) {
-                var rList = $('<div class="andrprod-source-list"></div>');
-                var r;
-                for (r = 0; r < filteredResults.length; r++) rList.append(buildResultCard(filteredResults[r], false));
-                bodyEl.append(rList);
+                bodyEl.append(list);
             } else {
-                bodyEl.append('<div class="andrprod-empty"><div class="andrprod-empty__title">' + (searchState.completedCount < searchState.totalPlugins ? 'Выполняется поиск...' : 'Прямые потоковые результаты не получены') + '</div><div class="andrprod-empty__desc">Выберите любой установленный онлайн-плагин выше для запуска через его оригинальный интерфейс.</div></div>');
+                bodyEl.append('<div class="andrprod-empty"><div class="andrprod-empty__title">' + (state && state.isSearching ? 'Идёт параллельный поиск по источникам...' : 'Прямых вариантов воспроизведения не найдено') + '</div><div class="andrprod-empty__desc">Если у установленного плагина нет программного API, откройте его напрямую из списка статусов ниже.</div></div>');
             }
 
-            // 4. Повтор для проблемных плагинов
-            var errRows = [];
-            var pid;
-            for (pid in searchState.pluginStatuses) {
-                if (!searchState.pluginStatuses.hasOwnProperty(pid)) continue;
-                var pst = searchState.pluginStatuses[pid];
-                if (pst.status === 'error' || pst.status === 'unavailable') errRows.push(pst);
-            }
-            if (errRows.length) {
-                bodyEl.append('<div class="andrprod-section-title">Ошибки плагинов (' + errRows.length + ')</div>');
-                var eList = $('<div class="andrprod-source-list"></div>');
-                var ei;
-                for (ei = 0; ei < errRows.length; ei++) {
+            // Статусы каждого источника (если включено отображение процесса поиска)
+            if (state && StorageManager.isShowProgress()) {
+                bodyEl.append('<div class="andrprod-section-title">Состояние источников (' + state.completed + '/' + state.total + ')</div>');
+                var sList = $('<div class="andrprod-source-list"></div>');
+                var sid;
+                for (sid in state.statuses) {
+                    if (!state.statuses.hasOwnProperty(sid)) continue;
                     (function (st) {
                         var row = $(
                             '<div class="andrprod-source-card selector">' +
                                 '<div class="andrprod-source-card__main">' +
-                                    '<div class="andrprod-source-card__header"><span class="andrprod-status-dot is-offline"></span><span class="andrprod-source-card__title">' + escapeHtml(st.plugin.name) + '</span><span class="andrprod-chip">' + escapeHtml(st.label) + '</span></div>' +
+                                    '<div class="andrprod-source-card__header">' +
+                                        '<span class="andrprod-status-dot ' + mapStatusDot(st.status) + '"></span>' +
+                                        '<span class="andrprod-source-card__title">' + escapeHtml(st.info.name) + '</span>' +
+                                        '<span class="andrprod-chip">' + escapeHtml(st.label) + '</span>' +
+                                    '</div>' +
                                     (st.error ? '<div class="andrprod-source-card__sub">' + escapeHtml(st.error) + '</div>' : '') +
                                 '</div>' +
-                                '<div class="andrprod-source-card__right"><span class="andrprod-badge is-off">↻ Повторить</span></div>' +
+                                '<div class="andrprod-source-card__right"><span class="andrprod-badge is-off">' + (st.status === 'unsupported' ? '▶ Открыть в плагине' : 'Инфо') + '</span></div>' +
                             '</div>'
                         );
-                        row.on('hover:enter', function () { retrySinglePlugin(st.plugin); });
+                        row.on('hover:enter', function () {
+                            if (st.status === 'unsupported') CardIntegration.launchPluginLiveButton(st.info.id);
+                            else HubLauncher.open({ view: 'sources' });
+                        });
                         row.on('hover:focus', function () { lastFocused = row[0]; scroll.update(row, true); });
-                        eList.append(row);
-                    })(errRows[ei]);
+                        sList.append(row);
+                    })(state.statuses[sid]);
                 }
-                bodyEl.append(eList);
+                bodyEl.append(sList);
             }
 
             Lampa.Controller.collectionSet(html);
@@ -2404,30 +1517,10 @@
             }
         }
 
-        function buildResultCard(res, isBest) {
-            var qLabel = FilterEngine.getQualityLabel(res);
-            var card = $(
-                '<div class="andrprod-source-card selector ' + (isBest ? 'is-best-choice' : '') + '">' +
-                    '<div class="andrprod-source-card__main">' +
-                        '<div class="andrprod-source-card__header">' +
-                            '<span class="andrprod-plugin-tag">' + escapeHtml(res.pluginName) + '</span>' +
-                            '<span class="andrprod-source-card__title">' + escapeHtml(res.sourceName) + '</span>' +
-                            (isBest ? '<span class="andrprod-star">★ Лучший выбор</span>' : '') +
-                        '</div>' +
-                        '<div class="andrprod-chips-row">' +
-                            '<span class="andrprod-chip">Качество: <b>' + escapeHtml(qLabel) + '</b></span>' +
-                            (res.voice ? '<span class="andrprod-chip">Перевод: <b>' + escapeHtml(res.voice) + '</b></span>' : '') +
-                            (res.hasSubtitles ? '<span class="andrprod-chip">Субтитры: <b class="is-yes">Да</b></span>' : '') +
-                            (res.season ? '<span class="andrprod-chip">Сезон: <b>' + escapeHtml(res.season) + '</b></span>' : '') +
-                            (res.episode ? '<span class="andrprod-chip">Серия: <b>' + escapeHtml(res.episode) + '</b></span>' : '') +
-                        '</div>' +
-                    '</div>' +
-                    '<div class="andrprod-source-card__right"><span class="andrprod-badge is-on">▶ Запустить</span></div>' +
-                '</div>'
-            );
-            card.on('hover:enter', function () { UnifiedSearchEngine.launchResult(res, mediaMeta, buttonMap); });
-            card.on('hover:focus', function () { lastFocused = card[0]; scroll.update(card, true); });
-            return card;
+        function getScopeName(id) {
+            if (!id || id === 'all') return 'Все';
+            var ad = SourceRegistry.getAdapterById(id);
+            return ad ? ad.getSourceInfo().name : id;
         }
 
         this.start = function () {
@@ -2444,504 +1537,180 @@
             });
             Lampa.Controller.toggle('content');
         };
-
         this.pause = function () {};
         this.stop = function () {};
         this.render = function () { return html; };
         this.destroy = function () {
             isDestroyed = true;
+            UnifiedSearchEngine.cancelActiveSearch();
             try { scroll.destroy(); } catch (e) {}
             html.remove();
         };
     }
 
     // =========================================================================
-    // 14. ОБЩЕЕ МЕНЮ ФИЛЬТРОВ (4K/1080p/720p/SD + HDR + DV + Перевод + Субтитры)
-    // =========================================================================
-    function openSharedFiltersMenu(onChanged) {
-        var f = StorageManager.getFilters();
-        var pl = f.pluginId !== 'all' ? SourceRegistry.getPluginById(f.pluginId) : null;
-
-        Lampa.Select.show({
-            title: 'Фильтры ANDRPROD',
-            items: [
-                { title: 'Качество видео', subtitle: getQualityFilterName(f.quality), action: 'quality' },
-                { title: 'Тип контента', subtitle: getContentTypeName(f.contentType), action: 'contentType' },
-                { title: 'Онлайн-плагин', subtitle: pl ? pl.name : 'Все плагины', action: 'pluginId' },
-                { title: 'Сортировка', subtitle: getSortLabel(f.sortBy), action: 'sortBy' },
-                { title: 'Только HDR', subtitle: f.onlyHDR ? 'Вкл ✓' : 'Выкл', action: 'toggle_hdr' },
-                { title: 'Только Dolby Vision', subtitle: f.onlyDV ? 'Вкл ✓' : 'Выкл', action: 'toggle_dv' },
-                { title: 'С переводом', subtitle: f.onlyTranslated ? 'Вкл ✓' : 'Выкл', action: 'toggle_tr' },
-                { title: 'С субтитрами', subtitle: f.onlySubtitles ? 'Вкл ✓' : 'Выкл', action: 'toggle_sub' },
-                { title: 'Только рабочие', subtitle: f.onlyWorking ? 'Вкл ✓' : 'Выкл', action: 'toggle_working' },
-                { title: 'Только избранные', subtitle: f.onlyFavorites ? 'Вкл ✓' : 'Выкл', action: 'toggle_favs' },
-                { title: 'Скрыть недоступные', subtitle: f.hideUnavailable ? 'Вкл ✓' : 'Выкл', action: 'toggle_hide' },
-                { title: '↺ Сбросить все фильтры', action: 'reset' }
-            ],
-            onSelect: function (item) {
-                function toggleAndReopen(key) {
-                    var patch = {};
-                    patch[key] = !f[key];
-                    StorageManager.setFilters(patch);
-                    if (onChanged) onChanged();
-                    openSharedFiltersMenu(onChanged);
-                }
-                if (item.action === 'quality') {
-                    openSubSelect('Качество видео', 'quality', [
-                        { id: 'all', title: 'Любое' }, { id: '4k', title: '4K / 2160p' },
-                        { id: '1080p', title: '1080p / Full HD' }, { id: '720p', title: '720p / HD' },
-                        { id: 'sd', title: 'SD' }, { id: 'unknown', title: 'Неизвестно' }
-                    ], onChanged);
-                } else if (item.action === 'contentType') {
-                    openSubSelect('Тип контента', 'contentType', [
-                        { id: 'all', title: 'Всё' }, { id: 'movie', title: 'Фильмы' },
-                        { id: 'series', title: 'Сериалы' }, { id: 'cartoon', title: 'Мультфильмы' }, { id: 'anime', title: 'Аниме' }
-                    ], onChanged);
-                } else if (item.action === 'pluginId') {
-                    var pls = SourceRegistry.getPlugins();
-                    var pOpts = [{ id: 'all', title: 'Все плагины' }];
-                    var i;
-                    for (i = 0; i < pls.length; i++) pOpts.push({ id: pls[i].id, title: 'Только ' + pls[i].name });
-                    openSubSelect('Онлайн-плагин', 'pluginId', pOpts, onChanged);
-                } else if (item.action === 'sortBy') {
-                    openSubSelect('Сортировка', 'sortBy', [
-                        { id: 'priority', title: 'По приоритету' }, { id: 'quality', title: 'По качеству' },
-                        { id: 'speed', title: 'По скорости ответа' }, { id: 'name', title: 'По названию' }
-                    ], onChanged);
-                } else if (item.action === 'toggle_hdr') toggleAndReopen('onlyHDR');
-                else if (item.action === 'toggle_dv') toggleAndReopen('onlyDV');
-                else if (item.action === 'toggle_tr') toggleAndReopen('onlyTranslated');
-                else if (item.action === 'toggle_sub') toggleAndReopen('onlySubtitles');
-                else if (item.action === 'toggle_working') toggleAndReopen('onlyWorking');
-                else if (item.action === 'toggle_favs') toggleAndReopen('onlyFavorites');
-                else if (item.action === 'toggle_hide') toggleAndReopen('hideUnavailable');
-                else if (item.action === 'reset') {
-                    StorageManager.resetFilters();
-                    if (onChanged) onChanged();
-                    Lampa.Controller.toggle('content');
-                }
-            },
-            onBack: function () { Lampa.Controller.toggle('content'); }
-        });
-    }
-
-    function openSubSelect(title, field, opts, onChanged) {
-        var cur = StorageManager.getFilters()[field];
-        var i;
-        for (i = 0; i < opts.length; i++) opts[i].selected = opts[i].id === cur;
-        Lampa.Select.show({
-            title: title,
-            items: opts,
-            onSelect: function (item) {
-                var patch = {};
-                patch[field] = item.id;
-                StorageManager.setFilters(patch);
-                if (onChanged) onChanged();
-                openSharedFiltersMenu(onChanged);
-            },
-            onBack: function () { openSharedFiltersMenu(onChanged); }
-        });
-    }
-
-    // =========================================================================
-    // 15. ЦЕНТР УПРАВЛЕНИЯ ANDRPROD + ЭКРАН ДИАГНОСТИКИ (AndrprodHubComponent)
+    // 12. РАЗДЕЛЫ «ВЫБРАТЬ ИСТОЧНИКИ» И «ДИАГНОСТИКА» (AndrprodHubComponent)
     // =========================================================================
     var HubLauncher = {
         open: function (params) {
             params = params || {};
             Lampa.Activity.push({
                 url: '',
-                title: 'ANDRPROD',
+                title: PLUGIN_NAME,
                 component: HUB_COMPONENT,
-                view: params.view || 'home',
-                pluginId: params.pluginId || '',
+                view: params.view || 'sources',
                 page: 1
             });
         }
     };
 
     function AndrprodHubComponent(object) {
-        var currentView = (object && object.view) ? object.view : 'home';
-        var selectedPluginId = (object && object.pluginId) ? object.pluginId : '';
+        var currentView = (object && object.view) ? object.view : 'sources';
         var scroll = new Lampa.Scroll({ mask: true, over: true });
         var html = $('<div class="andrprod-hub"></div>');
-        var topbarEl = null;
-        var navEl = null;
         var bodyEl = null;
         var lastFocused = null;
         var isDestroyed = false;
 
-        var NAV_TABS = [
-            { id: 'home', title: 'Плагины' },
-            { id: 'all_sources', title: 'Все источники' },
-            { id: 'favorites', title: 'Избранное' },
-            { id: 'settings', title: 'Настройки' },
-            { id: 'diagnostics', title: 'Диагностика' }
-        ];
-
         this.create = function () {
             SourceRegistry.resetAndScan();
             buildShell();
-            renderCurrentView();
-
-            SourceRegistry.discoverAllPluginSources(function () {
-                if (!isDestroyed && currentView !== 'settings') {
-                    updateHeaderStats();
-                    renderCurrentView(true);
-                }
-            });
-
-            if (StorageManager.isAutoSearch()) {
-                HealthChecker.checkAll(false, function () {
-                    if (!isDestroyed && currentView !== 'settings') {
-                        updateHeaderStats();
-                        renderCurrentView(true);
-                    }
-                });
-            }
+            renderView();
             return this.render();
         };
 
         function buildShell() {
             html.empty();
-            topbarEl = $(
+            var head = $(
                 '<div class="andrprod-hub__header">' +
-                    '<div class="andrprod-hub__brand">' +
-                        BrandIcons.getLogoSvg('andrprod-hub__logo', 'hub') +
-                        '<div class="andrprod-hub__stats"></div>' +
-                    '</div>' +
+                    '<div class="andrprod-hub__brand">' + BrandIcons.getLogoSvg('andrprod-hub__logo', 'hub') + '</div>' +
                     '<div class="andrprod-hub__toolbar">' +
-                        '<div class="andrprod-pill selector andrprod-btn-search">Поиск</div>' +
-                        '<div class="andrprod-pill selector andrprod-btn-filters">Фильтры</div>' +
-                        '<div class="andrprod-pill selector andrprod-btn-refresh">Обновить</div>' +
+                        '<div class="andrprod-pill selector andrprod-tab-src">Выбрать источники</div>' +
+                        '<div class="andrprod-pill selector andrprod-tab-diag">Диагностика</div>' +
+                        '<div class="andrprod-pill selector andrprod-btn-checkall">Проверить все источники</div>' +
                     '</div>' +
                 '</div>'
             );
-
-            topbarEl.find('.andrprod-btn-search').on('hover:enter', function () {
-                var cur = StorageManager.getFilters().searchQuery || '';
-                if (Lampa.Input && typeof Lampa.Input.edit === 'function') {
-                    Lampa.Input.edit({ title: 'Поиск по онлайн-плагинам и источникам', value: cur, free: true, nosave: true }, function (val) {
-                        StorageManager.setFilters({ searchQuery: safeTrim(String(val || '')) });
-                        renderCurrentView();
-                        Lampa.Controller.toggle('content');
-                    });
-                }
-            });
-            topbarEl.find('.andrprod-btn-filters').on('hover:enter', function () {
-                openSharedFiltersMenu(function () { renderCurrentView(); });
-            });
-            topbarEl.find('.andrprod-btn-refresh').on('hover:enter', function () {
-                if (Lampa.Noty) Lampa.Noty.show('ANDRPROD: Обновление онлайн-плагинов и источников...');
-                SourceRegistry.resetAndScan();
-                SourceRegistry.discoverAllPluginSources(null, function () {
-                    HealthChecker.checkAll(true, null, function () {
-                        if (!isDestroyed) {
-                            updateHeaderStats();
-                            renderCurrentView(true);
-                            if (Lampa.Noty) Lampa.Noty.show('ANDRPROD: Обновление завершено.');
-                        }
-                    });
+            head.find('.andrprod-tab-src').on('hover:enter', function () { currentView = 'sources'; renderView(); });
+            head.find('.andrprod-tab-diag').on('hover:enter', function () { currentView = 'diagnostics'; renderView(); });
+            head.find('.andrprod-btn-checkall').on('hover:enter', function () {
+                if (Lampa.Noty) Lampa.Noty.show(PLUGIN_NAME + ': Проверка всех источников...');
+                UnifiedSearchEngine.checkAllSources(function () {
+                    if (!isDestroyed) renderView(true);
+                }, function () {
+                    if (!isDestroyed) {
+                        renderView(true);
+                        if (Lampa.Noty) Lampa.Noty.show(PLUGIN_NAME + ': Проверка завершена.');
+                    }
                 });
             });
-
-            navEl = $('<div class="andrprod-hub__tabs"></div>');
-            var i;
-            for (i = 0; i < NAV_TABS.length; i++) {
-                (function (tab) {
-                    var tabBtn = $('<div class="andrprod-tab selector" data-view="' + tab.id + '">' + tab.title + '</div>');
-                    tabBtn.on('hover:enter', function () {
-                        currentView = tab.id;
-                        selectedPluginId = '';
-                        renderCurrentView();
-                    });
-                    navEl.append(tabBtn);
-                })(NAV_TABS[i]);
-            }
-
             bodyEl = $('<div class="andrprod-hub__body"></div>');
             scroll.append(bodyEl);
-            html.append(topbarEl);
-            html.append(navEl);
+            html.append(head);
             html.append(scroll.render());
-            updateHeaderStats();
         }
 
-        function updateHeaderStats() {
-            var pluginsCount = SourceRegistry.getPlugins().length;
-            var sourcesCount = SourceRegistry.getAllSources().length;
-            var filters = StorageManager.getFilters();
-            var activeCount = FilterEngine.countActiveFilters(filters);
-
-            topbarEl.find('.andrprod-hub__stats').html(
-                '<span>Онлайн-плагинов: <b>' + pluginsCount + '</b></span>' +
-                '<span class="andrprod-dot-sep">•</span>' +
-                '<span>Источников: <b>' + sourcesCount + '</b></span>' +
-                (filters.searchQuery ? '<span class="andrprod-dot-sep">•</span><span class="andrprod-search-tag">Поиск: «' + escapeHtml(filters.searchQuery) + '»</span>' : '')
-            );
-            topbarEl.find('.andrprod-btn-filters').text(activeCount > 0 ? ('Фильтры (' + activeCount + ')') : 'Фильтры');
-        }
-
-        function renderCurrentView(preserveFocus) {
-            if (isDestroyed) return;
-            updateHeaderStats();
-            navEl.find('.andrprod-tab').removeClass('is-active');
-            navEl.find('.andrprod-tab[data-view="' + (currentView === 'plugin' ? 'home' : currentView) + '"]').addClass('is-active');
+        function renderView(preserveFocus) {
+            if (isDestroyed || !bodyEl) return;
             bodyEl.empty();
-
-            if (currentView === 'home') renderHomePluginsView();
-            else if (currentView === 'plugin') renderPluginDetailView(selectedPluginId);
-            else if (currentView === 'all_sources') renderAllSourcesCatalog();
-            else if (currentView === 'favorites') renderFavoritesView();
-            else if (currentView === 'settings') renderSettingsView();
-            else if (currentView === 'diagnostics') renderDiagnosticsView();
+            if (currentView === 'diagnostics') renderDiagnostics();
+            else renderSelectSources();
 
             Lampa.Controller.collectionSet(html);
             if (!preserveFocus) {
-                var first = bodyEl.find('.selector')[0] || navEl.find('.andrprod-tab.is-active')[0];
+                var first = bodyEl.find('.selector')[0] || html.find('.selector')[0];
                 if (first) Lampa.Controller.collectionFocus(first, html);
             }
         }
 
-        function renderHomePluginsView() {
-            var plugins = SourceRegistry.getPlugins();
-            if (!plugins.length) {
-                bodyEl.append('<div class="andrprod-empty"><div class="andrprod-empty__title">Онлайн-кинотеатры не обнаружены</div><div class="andrprod-empty__desc">ANDRPROD отображает только подтверждённые онлайн-плагины (Alpaca, Lampac, Online Mod, Lumio, BWA, Showy, HDRezka, KinoPub, Filmix, Kodik и др.). Посторонние расширения показаны во вкладке «Диагностика».</div></div>');
+        function renderSelectSources() {
+            var adapters = SourceRegistry.getAdapters();
+            bodyEl.append('<div class="andrprod-section-title">Выбрать источники (' + adapters.length + ')</div>');
+            if (!adapters.length) {
+                bodyEl.append('<div class="andrprod-empty"><div class="andrprod-empty__title">Онлайн-источники не обнаружены</div><div class="andrprod-empty__desc">Установите совместимые онлайн-плагины в Lampa → Настройки → Расширения.</div></div>');
                 return;
             }
-            var grid = $('<div class="andrprod-plugin-grid"></div>');
+            var list = $('<div class="andrprod-source-list"></div>');
             var i;
-            for (i = 0; i < plugins.length; i++) {
-                (function (pl) {
-                    var health = SourceRegistry.getHealth(pl.id);
-                    var fav = StorageManager.isPluginFavorite(pl.id);
-                    var srcs = SourceRegistry.getPluginSources(pl.id);
-                    var card = $(
-                        '<div class="andrprod-plugin-card selector">' +
-                            '<div class="andrprod-plugin-card__top">' +
-                                BrandIcons.getPluginIconHtml(pl) +
-                                '<div class="andrprod-plugin-card__info">' +
-                                    '<div class="andrprod-plugin-card__name">' + escapeHtml(pl.name) + (fav ? ' <span class="andrprod-star">★</span>' : '') + '</div>' +
-                                    '<div class="andrprod-plugin-card__count">Источников: <b>' + srcs.length + '</b></div>' +
+            for (i = 0; i < adapters.length; i++) {
+                (function (ad, idx) {
+                    var info = ad.getSourceInfo();
+                    var enabled = StorageManager.isSourceEnabled(info.id);
+                    var chk = Diagnostics.lastCheckResults[info.id];
+                    var row = $(
+                        '<div class="andrprod-source-card selector ' + (enabled ? '' : 'is-disabled') + '">' +
+                            '<div class="andrprod-source-card__main">' +
+                                '<div class="andrprod-source-card__header">' +
+                                    '<span class="andrprod-status-dot ' + (chk ? (chk.ok ? 'is-online' : 'is-offline') : 'is-unknown') + '"></span>' +
+                                    '<span class="andrprod-source-card__title">#' + (idx + 1) + ' ' + escapeHtml(info.name) + '</span>' +
+                                    '<span class="andrprod-chip">' + (info.integrationLevel === 'full' ? 'Полная интеграция' : 'Кнопка плагина') + '</span>' +
+                                '</div>' +
+                                '<div class="andrprod-source-card__sub">' +
+                                    (chk ? (escapeHtml(chk.message) + ' (' + chk.latency + ' мс) • ') : '') +
+                                    escapeHtml(info.reason) +
                                 '</div>' +
                             '</div>' +
-                            '<div class="andrprod-plugin-card__bottom">' +
-                                '<div class="andrprod-status-line"><span class="andrprod-status-dot ' + getStatusDotClass(health.status) + '"></span><span>' + escapeHtml(getStatusHumanLabel(health)) + '</span></div>' +
-                                '<div class="andrprod-open-cta">Открыть →</div>' +
-                            '</div>' +
+                            '<div class="andrprod-source-card__right"><span class="andrprod-badge ' + (enabled ? 'is-on' : 'is-off') + '">' + (enabled ? 'Включён' : 'Отключён') + '</span></div>' +
                         '</div>'
                     );
-                    card.on('hover:enter', function () { selectedPluginId = pl.id; currentView = 'plugin'; renderCurrentView(); });
-                    card.on('hover:focus', function () { lastFocused = card[0]; scroll.update(card, true); });
-                    grid.append(card);
-                })(plugins[i]);
-            }
-            bodyEl.append(grid);
-        }
-
-        function renderPluginDetailView(pluginId) {
-            var pl = SourceRegistry.getPluginById(pluginId);
-            if (!pl) { currentView = 'home'; renderHomePluginsView(); return; }
-            var health = SourceRegistry.getHealth(pl.id);
-            var isFav = StorageManager.isPluginFavorite(pl.id);
-            var allPlSources = SourceRegistry.getPluginSources(pl.id);
-
-            var detailHead = $(
-                '<div class="andrprod-detail-head">' +
-                    '<div class="andrprod-detail-head__left">' +
-                        BrandIcons.getPluginIconHtml(pl) +
-                        '<div>' +
-                            '<div class="andrprod-detail-head__title">' + escapeHtml(String(pl.name).toUpperCase()) + '</div>' +
-                            '<div class="andrprod-detail-head__sub"><span class="andrprod-status-dot ' + getStatusDotClass(health.status) + '"></span> ' + escapeHtml(getStatusHumanLabel(health)) + ' • Источников: ' + allPlSources.length + '</div>' +
-                        '</div>' +
-                    '</div>' +
-                    '<div class="andrprod-detail-head__actions">' +
-                        '<div class="andrprod-pill selector andrprod-btn-back">← К плагинам</div>' +
-                        '<div class="andrprod-pill selector andrprod-btn-pl-fav">' + (isFav ? '★ В избранном' : '☆ В избранное') + '</div>' +
-                    '</div>' +
-                '</div>'
-            );
-            detailHead.find('.andrprod-btn-back').on('hover:enter', function () { currentView = 'home'; selectedPluginId = ''; renderCurrentView(); });
-            detailHead.find('.andrprod-btn-pl-fav').on('hover:enter', function () { StorageManager.togglePluginFavorite(pl.id); renderCurrentView(); });
-            bodyEl.append(detailHead);
-
-            var listEl = $('<div class="andrprod-source-list"></div>');
-            var i;
-            for (i = 0; i < allPlSources.length; i++) listEl.append(buildSourceCard(allPlSources[i], false));
-            bodyEl.append(listEl);
-        }
-
-        function renderAllSourcesCatalog() {
-            var all = SourceRegistry.getAllSources();
-            var filtered = FilterEngine.apply(all, StorageManager.getFilters());
-            bodyEl.append('<div class="andrprod-info-bar"><span>Показано источников: <b>' + filtered.length + '</b> из ' + all.length + '</span></div>');
-            if (!filtered.length) {
-                bodyEl.append('<div class="andrprod-empty"><div class="andrprod-empty__title">Источники по фильтрам не найдены</div></div>');
-                return;
-            }
-            var listEl = $('<div class="andrprod-source-list"></div>');
-            var i;
-            for (i = 0; i < filtered.length; i++) listEl.append(buildSourceCard(filtered[i], true));
-            bodyEl.append(listEl);
-        }
-
-        function buildSourceCard(src, showPluginBadge) {
-            var enabled = StorageManager.isEnabled(src.key);
-            var fav = StorageManager.isFavorite(src.key);
-            var health = SourceRegistry.getHealth(src.key);
-            var qLabel = FilterEngine.getQualityLabel(src);
-
-            var card = $(
-                '<div class="andrprod-source-card selector ' + (enabled ? '' : 'is-disabled') + '">' +
-                    '<div class="andrprod-source-card__main">' +
-                        '<div class="andrprod-source-card__header">' +
-                            '<span class="andrprod-status-dot ' + getStatusDotClass(health.status) + '"></span>' +
-                            (showPluginBadge ? '<span class="andrprod-plugin-tag">' + escapeHtml(src.pluginName) + '</span>' : '') +
-                            '<span class="andrprod-source-card__title">' + escapeHtml(src.name) + (fav ? ' <span class="andrprod-star">★</span>' : '') + '</span>' +
-                        '</div>' +
-                        '<div class="andrprod-chips-row">' +
-                            '<span class="andrprod-chip">Качество: <b>' + escapeHtml(qLabel) + '</b></span>' +
-                            '<span class="andrprod-chip">4K: ' + formatTriState(src.qualities.has4k) + '</span>' +
-                            '<span class="andrprod-chip">Full HD: ' + formatTriState(src.qualities.has1080p) + '</span>' +
-                            '<span class="andrprod-chip">HDR: ' + formatTriState(src.qualities.hasHDR) + '</span>' +
-                            '<span class="andrprod-chip">DV: ' + formatTriState(src.qualities.hasDV) + '</span>' +
-                        '</div>' +
-                        '<div class="andrprod-source-card__sub">' + escapeHtml(getStatusHumanLabel(health)) + (src.note ? ' • ' + escapeHtml(src.note) : '') + '</div>' +
-                    '</div>' +
-                    '<div class="andrprod-source-card__right"><span class="andrprod-badge ' + (enabled ? 'is-on' : 'is-off') + '">' + (enabled ? 'Активен' : 'Скрыт') + '</span></div>' +
-                '</div>'
-            );
-
-            card.on('hover:enter', function () {
-                Lampa.Select.show({
-                    title: src.pluginName + ' — ' + src.name,
-                    items: [
-                        { title: '▶ Запустить через плагин', action: 'launch' },
-                        { title: fav ? 'Убрать из избранных' : 'Добавить в избранные ★', action: 'fav' },
-                        { title: enabled ? 'Скрыть источник' : 'Показать источник', action: 'toggle' }
-                    ],
-                    onSelect: function (item) {
-                        if (item.action === 'launch') {
-                            if (!CardIntegration.launchPluginNativeButton(src.pluginId)) {
-                                if (Lampa.Noty) Lampa.Noty.show('ANDRPROD: Откройте карточку фильма/сериала и нажмите ANDRPROD для запуска «' + src.pluginName + '».');
-                            }
-                            return;
-                        }
-                        if (item.action === 'fav') StorageManager.toggleFavorite(src.key);
-                        if (item.action === 'toggle') StorageManager.setEnabled(src.key, !enabled);
-                        renderCurrentView();
-                        Lampa.Controller.toggle('content');
-                    },
-                    onBack: function () { Lampa.Controller.toggle('content'); }
-                });
-            });
-            card.on('hover:focus', function () { lastFocused = card[0]; scroll.update(card, true); });
-            return card;
-        }
-
-        function renderFavoritesView() {
-            var allSources = SourceRegistry.getAllSources();
-            var favSources = [];
-            var i;
-            for (i = 0; i < allSources.length; i++) if (StorageManager.isFavorite(allSources[i].key)) favSources.push(allSources[i]);
-            if (!favSources.length) {
-                bodyEl.append('<div class="andrprod-empty"><div class="andrprod-empty__title">Избранных источников пока нет</div></div>');
-                return;
-            }
-            var listEl = $('<div class="andrprod-source-list"></div>');
-            for (i = 0; i < favSources.length; i++) listEl.append(buildSourceCard(favSources[i], true));
-            bodyEl.append(listEl);
-        }
-
-        function renderSettingsView() {
-            var list = $('<div class="andrprod-settings-list"></div>');
-            var mode = StorageManager.getMode();
-            var modeText = mode === 'auto' ? 'Автоматический' : (mode === 'best' ? 'Лучший выбор' : 'Ручной');
-            var rows = [
-                {
-                    title: 'Режим поиска в карточке',
-                    desc: 'Ручной (с выбором плагинов) / Автоматический / Лучший выбор.',
-                    value: modeText,
-                    onEnter: function () {
-                        var next = mode === 'manual' ? 'auto' : (mode === 'auto' ? 'best' : 'manual');
-                        StorageManager.setMode(next);
-                        renderCurrentView();
-                    }
-                },
-                {
-                    title: 'Тайм-аут сетевых запросов',
-                    desc: 'Ограничение ожидания ответа от каждого плагина.',
-                    value: Math.round(StorageManager.getTimeout() / 1000) + ' сек',
-                    onEnter: function () {
-                        var opts = [3000, 6000, 9000, 12000];
-                        StorageManager.setTimeoutMs(opts[(opts.indexOf(StorageManager.getTimeout()) + 1) % opts.length]);
-                        renderCurrentView();
-                    }
-                },
-                {
-                    title: 'Сбросить сохранённые фильтры',
-                    desc: 'Очистить фильтры качества, HDR/DV, перевода и субтитров.',
-                    value: 'Сбросить',
-                    onEnter: function () { StorageManager.resetFilters(); renderCurrentView(); }
-                }
-            ];
-            var i;
-            for (i = 0; i < rows.length; i++) {
-                (function (row) {
-                    var el = $('<div class="andrprod-setting-row selector"><div class="andrprod-setting-row__text"><div class="andrprod-setting-row__title">' + escapeHtml(row.title) + '</div><div class="andrprod-setting-row__desc">' + escapeHtml(row.desc) + '</div></div><div class="andrprod-setting-row__val">' + escapeHtml(row.value) + '</div></div>');
-                    el.on('hover:enter', row.onEnter);
-                    el.on('hover:focus', function () { lastFocused = el[0]; scroll.update(el, true); });
-                    list.append(el);
-                })(rows[i]);
+                    row.on('hover:enter', function () {
+                        Lampa.Select.show({
+                            title: info.name,
+                            items: [
+                                { title: enabled ? 'Отключить источник' : 'Включить источник', act: 'toggle' },
+                                { title: 'Проверить доступность', act: 'check' },
+                                { title: 'Поднять приоритет ▲', act: 'up' },
+                                { title: 'Понизить приоритет ▼', act: 'down' }
+                            ],
+                            onSelect: function (it) {
+                                if (it.act === 'toggle') StorageManager.setSourceEnabled(info.id, !enabled);
+                                else if (it.act === 'up') StorageManager.movePriority(info.id, -1);
+                                else if (it.act === 'down') StorageManager.movePriority(info.id, 1);
+                                else if (it.act === 'check') {
+                                    ad.isAvailable(function (ok, msg, lat) {
+                                        Diagnostics.lastCheckResults[info.id] = { id: info.id, name: info.name, ok: !!ok, message: msg, latency: lat, checkedAt: Date.now() };
+                                        if (Lampa.Noty) Lampa.Noty.show(info.name + ': ' + msg);
+                                        if (!isDestroyed) renderView(true);
+                                    });
+                                }
+                                renderView(true);
+                                Lampa.Controller.toggle('content');
+                            },
+                            onBack: function () { Lampa.Controller.toggle('content'); }
+                        });
+                    });
+                    row.on('hover:focus', function () { lastFocused = row[0]; scroll.update(row, true); });
+                    list.append(row);
+                })(adapters[i], i);
             }
             bodyEl.append(list);
         }
 
-        // ---------------------------------------------------------------------
-        // ЭКРАН ДИАГНОСТИКИ ANDRPROD (Раздел 11)
-        // ---------------------------------------------------------------------
-        function renderDiagnosticsView() {
+        function renderDiagnostics() {
             var rep = Diagnostics.getReport();
             var list = $('<div class="andrprod-settings-list"></div>');
             var metrics = [
-                { k: 'Статус плагина ANDRPROD', v: (rep.loaded ? 'Загружен' : 'Ошибка') + ' (v' + rep.version + ')' },
-                { k: 'Регистрация манифеста (Lampa.Manifest.plugins)', v: rep.manifestRegistered ? 'Да' : 'Нет' },
-                { k: 'Компоненты (hub / search)', v: (rep.hubRegistered ? 'OK' : 'FAIL') + ' / ' + (rep.searchRegistered ? 'OK' : 'FAIL') },
-                { k: 'Интеграция с карточкой фильма (full)', v: rep.cardIntegrationActive ? ('Активна' + (rep.lastCardEventAt ? ' • событие в ' + formatTime(rep.lastCardEventAt) : '')) : 'Не активна' },
-                { k: 'Обнаружено онлайн-плагинов (белый список)', v: String(rep.onlinePluginsCount) },
-                { k: 'Получено источников', v: String(rep.sourcesCount) },
-                { k: 'Активные адаптеры', v: rep.activeAdapters.length ? rep.activeAdapters.join(', ') : 'Нет' },
-                { k: 'Время последнего поиска', v: rep.lastSearchDurationMs ? (rep.lastSearchDurationMs + ' мс') : 'Поиск не запускался' }
+                { k: 'Версия плагина', v: 'v' + rep.version },
+                { k: 'Состояние загрузки / инициализации', v: (rep.loaded ? 'Загружен' : 'Нет') + ' / ' + (rep.initialized ? 'Инициализирован' : 'Ошибка') },
+                { k: 'Обнаружено / Активных / Неподдерживаемых', v: rep.discoveredCount + ' / ' + rep.activeCount + ' / ' + rep.unsupportedCount },
+                { k: 'Последняя ошибка', v: rep.lastError ? ('[' + rep.lastError.module + '] ' + rep.lastError.message) : 'Нет' },
+                { k: 'Время последнего поиска', v: rep.lastSearchAt ? (formatTime(rep.lastSearchAt) + ' (' + rep.lastSearchDurationMs + ' мс, найдено: ' + rep.lastResultCount + ')') : 'Не выполнялся' }
             ];
-
             var i;
             for (i = 0; i < metrics.length; i++) {
-                var row = $('<div class="andrprod-setting-row selector"><div class="andrprod-setting-row__title">' + escapeHtml(metrics[i].k) + '</div><div class="andrprod-setting-row__val">' + escapeHtml(metrics[i].v) + '</div></div>');
-                row.on('hover:focus', function () { lastFocused = this; scroll.update($(this), true); });
-                list.append(row);
+                list.append('<div class="andrprod-setting-row"><div class="andrprod-setting-row__title">' + escapeHtml(metrics[i].k) + '</div><div class="andrprod-setting-row__val">' + escapeHtml(metrics[i].v) + '</div></div>');
             }
             bodyEl.append(list);
 
-            if (rep.unsupportedPlugins.length) {
-                bodyEl.append('<div class="andrprod-section-title">Отфильтрованные / неподдерживаемые расширения (' + rep.unsupportedPlugins.length + ')</div>');
-                var uList = $('<div class="andrprod-source-list"></div>');
-                for (i = 0; i < rep.unsupportedPlugins.length; i++) {
-                    var u = rep.unsupportedPlugins[i];
-                    uList.append('<div class="andrprod-source-card"><div class="andrprod-source-card__main"><div class="andrprod-source-card__title">' + escapeHtml(u.name) + '</div><div class="andrprod-source-card__sub">' + escapeHtml(u.reason) + '</div></div></div>');
+            var chkKeys = Object.keys(rep.lastCheckResults || {});
+            if (chkKeys.length) {
+                bodyEl.append('<div class="andrprod-section-title">Результаты проверки источников (' + chkKeys.length + ')</div>');
+                var cList = $('<div class="andrprod-source-list"></div>');
+                for (i = 0; i < chkKeys.length; i++) {
+                    var c = rep.lastCheckResults[chkKeys[i]];
+                    cList.append('<div class="andrprod-source-card"><div class="andrprod-source-card__main"><div class="andrprod-source-card__header"><span class="andrprod-status-dot ' + (c.ok ? 'is-online' : 'is-offline') + '"></span><span class="andrprod-source-card__title">' + escapeHtml(c.name) + '</span></div><div class="andrprod-source-card__sub">' + escapeHtml(c.message) + ' • ' + c.latency + ' мс</div></div></div>');
                 }
-                bodyEl.append(uList);
-            }
-
-            bodyEl.append('<div class="andrprod-section-title">Журнал ошибок (' + rep.errors.length + ')</div>');
-            if (!rep.errors.length) {
-                bodyEl.append('<div class="andrprod-empty"><div class="andrprod-empty__title">Ошибок не зафиксировано</div></div>');
-            } else {
-                var eList = $('<div class="andrprod-source-list"></div>');
-                for (i = 0; i < rep.errors.length; i++) {
-                    var er = rep.errors[i];
-                    eList.append('<div class="andrprod-source-card"><div class="andrprod-source-card__main"><div class="andrprod-source-card__title">[' + escapeHtml(er.module) + '] ' + escapeHtml(er.time) + '</div><div class="andrprod-source-card__sub">' + escapeHtml(er.message) + '</div></div></div>');
-                }
-                bodyEl.append(eList);
+                bodyEl.append(cList);
             }
         }
 
@@ -2949,79 +1718,118 @@
             Lampa.Controller.add('content', {
                 toggle: function () {
                     Lampa.Controller.collectionSet(html);
-                    Lampa.Controller.collectionFocus(lastFocused || navEl.find('.andrprod-tab.is-active')[0] || false, html);
+                    Lampa.Controller.collectionFocus(lastFocused || html.find('.selector')[0] || false, html);
                 },
                 left: function () { if (typeof Navigator !== 'undefined' && Navigator.canmove('left')) Navigator.move('left'); else Lampa.Controller.toggle('menu'); },
                 right: function () { if (typeof Navigator !== 'undefined') Navigator.move('right'); },
                 up: function () { if (typeof Navigator !== 'undefined' && Navigator.canmove('up')) Navigator.move('up'); else Lampa.Controller.toggle('head'); },
                 down: function () { if (typeof Navigator !== 'undefined') Navigator.move('down'); },
-                back: function () {
-                    if (currentView === 'plugin') { currentView = 'home'; selectedPluginId = ''; renderCurrentView(); }
-                    else Lampa.Activity.backward();
-                }
+                back: function () { Lampa.Activity.backward(); }
             });
             Lampa.Controller.toggle('content');
         };
-
         this.pause = function () {};
         this.stop = function () {};
         this.render = function () { return html; };
-        this.destroy = function () {
-            isDestroyed = true;
-            try { scroll.destroy(); } catch (e) {}
-            html.remove();
-        };
+        this.destroy = function () { isDestroyed = true; try { scroll.destroy(); } catch (e) {} html.remove(); };
     }
 
     // =========================================================================
-    // 16. УТИЛИТЫ, НАСТРОЙКИ LAMPA И СТИЛИ
+    // 13. НАСТРОЙКИ В LAMPA (Lampa → Настройки → ANDRPROD DD)
     // =========================================================================
-    function safeTrim(str) {
-        return String(str || '').replace(/^\s+|\s+$/g, '');
-    }
-    function formatTriState(val) {
-        if (val === true) return '<b class="is-yes">Да</b>';
-        if (val === false) return '<span class="is-no">Нет</span>';
-        return '<span class="is-unk">Неизвестно</span>';
-    }
+    var SettingsIntegration = {
+        init: function () {
+            if (!Lampa.SettingsApi) return;
+            try {
+                Lampa.SettingsApi.addComponent({ component: PLUGIN_ID, name: PLUGIN_NAME, icon: BrandIcons.getMiniIconSvg() });
+
+                // --- Источники ---
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: 'andrprod_dd_btn_sources', type: 'button' },
+                    field: { name: 'Выбрать источники', description: 'Включение, отключение, приоритет и проверка доступности источников' },
+                    onChange: function () { HubLauncher.open({ view: 'sources' }); }
+                });
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: 'andrprod_dd_btn_checkall', type: 'button' },
+                    field: { name: 'Проверить все источники', description: 'Запустить проверку работоспособности всех источников' },
+                    onChange: function () { HubLauncher.open({ view: 'diagnostics' }); UnifiedSearchEngine.checkAllSources(); }
+                });
+
+                // --- Языки ---
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.langUk, type: 'trigger', 'default': true }, field: { name: 'Язык: Украинский', description: 'Показывать варианты с украинской озвучкой' } });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.langRu, type: 'trigger', 'default': true }, field: { name: 'Язык: Русский', description: 'Показывать варианты с русской озвучкой' } });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.langEn, type: 'trigger', 'default': true }, field: { name: 'Язык: Английский', description: 'Отключите, чтобы скрыть английские источники и озвучку' } });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.langOther, type: 'trigger', 'default': true }, field: { name: 'Язык: Другие языки', description: 'Показывать остальные языки озвучки' } });
+
+                // --- Фильтрация и качество ---
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: STORAGE_KEYS.minQuality, type: 'select', values: { any: 'Не имеет значения', '480p': '480p', '720p': '720p', '1080p': '1080p', '2160p': '2160p', '4k': '4K' }, 'default': 'any' },
+                    field: { name: 'Минимальное качество видео', description: 'Отсеивать варианты ниже выбранного качества' }
+                });
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: STORAGE_KEYS.maxQuality, type: 'select', values: { any: 'Не имеет значения', '4k': '4K', '2160p': '2160p', '1080p': '1080p', '720p': '720p', '480p': '480p' }, 'default': 'any' },
+                    field: { name: 'Максимальное качество видео', description: 'Ограничить верхнее разрешение видео' }
+                });
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: STORAGE_KEYS.prefVoice, type: 'select', values: { any: 'Любая', dub: 'Дубляж', multi: 'Многоголосая', orig: 'Оригинал' }, 'default': 'any' },
+                    field: { name: 'Предпочитаемая озвучка', description: 'Приоритетный тип озвучки при фильтрации' }
+                });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.hideUnavailable, type: 'trigger', 'default': false }, field: { name: 'Скрывать недоступные источники', description: 'Не показывать источники, не прошедшие проверку' } });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.hideUnmatched, type: 'trigger', 'default': true }, field: { name: 'Скрывать неподходящие варианты', description: 'Скрывать результаты с неизвестным качеством при активном фильтре' } });
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: STORAGE_KEYS.sortBy, type: 'select', values: { priority: 'По приоритету источников', quality: 'По качеству видео', speed: 'По скорости ответа', name: 'По названию' }, 'default': 'priority' },
+                    field: { name: 'Сортировка результатов', description: 'Порядок отображения найденных вариантов' }
+                });
+
+                // --- Поиск ---
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: STORAGE_KEYS.searchMode, type: 'select', values: { auto: 'Автоматический поиск', manual: 'Ручной поиск', best: 'Лучший выбор' }, 'default': 'auto' },
+                    field: { name: 'Режим поиска', description: 'Автоматический запуск при открытии или ручной старт' }
+                });
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: STORAGE_KEYS.timeoutMs, type: 'select', values: { '3000': '3 сек', '6000': '6 сек', '9000': '9 сек', '12000': '12 сек' }, 'default': '6000' },
+                    field: { name: 'Таймаут источника', description: 'Защита от бесконечной загрузки при сбое источника' }
+                });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.retryOnError, type: 'trigger', 'default': true }, field: { name: 'Повторный запрос при ошибке', description: 'Одна автоматическая повторная попытка при сетевом сбое' } });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.showProgress, type: 'trigger', 'default': true }, field: { name: 'Отображение процесса поиска', description: 'Показывать статус каждого источника под результатами' } });
+
+                // --- Диагностика ---
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: 'andrprod_dd_btn_diag', type: 'button' },
+                    field: { name: 'Диагностика ANDRPROD DD', description: 'Версия, статус модулей, ошибки и проверка всех источников' },
+                    onChange: function () { HubLauncher.open({ view: 'diagnostics' }); }
+                });
+            } catch (e) {
+                Diagnostics.logError('SettingsIntegration', e);
+            }
+        }
+    };
+
+    // =========================================================================
+    // 14. УТИЛИТЫ И СТИЛИ
+    // =========================================================================
+    function safeTrim(str) { return String(str || '').replace(/^\s+|\s+$/g, ''); }
     function formatTime(ts) {
         try {
             var d = new Date(ts);
             return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2);
         } catch (e) { return ''; }
     }
-    function mapSearchStatusDot(st) {
+    function mapStatusDot(st) {
         if (st === 'found') return 'is-online';
         if (st === 'searching') return 'is-checking';
-        if (st === 'error' || st === 'unavailable') return 'is-offline';
+        if (st === 'error') return 'is-offline';
         if (st === 'unsupported') return 'is-ready';
         return 'is-unknown';
-    }
-    function getStatusDotClass(st) {
-        if (st === 'online') return 'is-online';
-        if (st === 'button_only') return 'is-ready';
-        if (st === 'offline') return 'is-offline';        if (st === 'checking') return 'is-checking';
-        return 'is-unknown';
-    }
-    function getStatusHumanLabel(h) {
-        if (!h) return 'Неизвестно';
-        if (h.status === 'online') return 'Доступен' + (h.latency ? ' (' + h.latency + ' мс)' : '');
-        if (h.status === 'button_only') return 'Готов (через кнопку плагина)';
-        if (h.status === 'offline') return h.message || 'Недоступен';
-        if (h.status === 'checking') return 'Проверка...';
-        return 'Не проверен';
-    }
-    function getQualityFilterName(id) {
-        var map = { all: 'Любое', '4k': '4K / 2160p', '2160p': '2160p', '1080p': '1080p / Full HD', '720p': '720p / HD', sd: 'SD', unknown: 'Неизвестно' };
-        return map[id] || id;
-    }
-    function getContentTypeName(id) {
-        var map = { all: 'Всё', movie: 'Фильмы', series: 'Сериалы', cartoon: 'Мультфильмы', anime: 'Аниме' };
-        return map[id] || id;
-    }
-    function getSortLabel(id) {
-        var map = { priority: 'По приоритету', quality: 'По качеству', speed: 'По скорости ответа', name: 'По названию' };
-        return map[id] || id;
     }
     function makeSafeId(str) {
         return String(str || 'src').toLowerCase().replace(/^https?:\/\//, '').replace(/[^a-z0-9а-яё]+/gi, '_').replace(/^_+|_+$/g, '').slice(0, 36) || 'src_custom';
@@ -3034,157 +1842,87 @@
             return file ? (file.charAt(0).toUpperCase() + file.slice(1)) : 'Плагин';
         } catch (e) { return 'Плагин'; }
     }
-    function cloneObj(obj) {
-        var out = {};
-        var k;
-        for (k in obj) if (obj.hasOwnProperty(k)) out[k] = obj[k];
-        return out;
-    }
     function escapeHtml(str) {
         return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
-    var SettingsIntegration = {
-        init: function () {
-            if (!Lampa.SettingsApi) return;
-            try {
-                Lampa.SettingsApi.addComponent({ component: PLUGIN_ID, name: 'ANDRPROD', icon: BrandIcons.getMiniIconSvg() });
-                Lampa.SettingsApi.addParam({
-                    component: PLUGIN_ID,
-                    param: { name: STORAGE_KEYS.mode, type: 'select', values: { manual: 'Ручной поиск', auto: 'Автоматический поиск', best: 'Лучший выбор' }, 'default': 'manual' },
-                    field: { name: 'Режим единого поиска', description: 'Ручной (с выбором плагинов), Автоматический или Лучший выбор' }
-                });
-                Lampa.SettingsApi.addParam({
-                    component: PLUGIN_ID,
-                    param: { name: STORAGE_KEYS.timeout, type: 'select', values: { '3000': '3 сек', '6000': '6 сек', '9000': '9 сек', '12000': '12 сек' }, 'default': '6000' },
-                    field: { name: 'Тайм-аут поиска', description: 'Ограничение времени ожидания ответа плагина' }
-                });
-                Lampa.SettingsApi.addParam({
-                    component: PLUGIN_ID,
-                    param: { name: 'andrprod_open_hub', type: 'button' },
-                    field: { name: 'Открыть каталог ANDRPROD', description: 'Онлайн-плагины, источники, фильтры' },
-                    onChange: function () { HubLauncher.open({ view: 'home' }); }
-                });
-                Lampa.SettingsApi.addParam({
-                    component: PLUGIN_ID,
-                    param: { name: 'andrprod_open_diag', type: 'button' },
-                    field: { name: 'Диагностика ANDRPROD', description: 'Проверка статуса модулей, плагинов и ошибок' },
-                    onChange: function () { HubLauncher.open({ view: 'diagnostics' }); }
-                });
-            } catch (e) {
-                Diagnostics.logError('SettingsIntegration', e);
-            }
-        }
-    };
-
     function injectStyles() {
         try {
-            if ($('#andrprod-styles').length) return;
+            if ($('#andrprod-dd-styles').length) return;
             var css = '' +
-                '.andrprod-card-btn{background:transparent!important;border:none!important;box-shadow:none!important;min-width:14.2em!important;height:3.6em!important;padding:0.55em 1.25em!important;display:inline-flex!important;align-items:center;justify-content:center;overflow:visible!important;transition:transform .18s ease,filter .18s ease;}' +
+                '.andrprod-card-btn{background:transparent!important;border:none!important;box-shadow:none!important;min-width:16.5em!important;height:3.6em!important;padding:0.55em 1.25em!important;display:inline-flex!important;align-items:center;justify-content:center;overflow:visible!important;transition:transform .18s ease,filter .18s ease;}' +
                 '.andrprod-card-btn.focus,.andrprod-card-btn:hover{background:transparent!important;box-shadow:none!important;transform:scale(1.07);filter:drop-shadow(0 0 16px rgba(56,189,248,.92));}' +
-                '.andrprod-card-btn__logo{height:2.5em!important;width:auto!important;max-width:none!important;display:block;overflow:visible;}' +
+                '.andrprod-card-btn__logo{height:2.45em!important;width:auto!important;max-width:none!important;display:block;overflow:visible;}' +
                 '.andrprod-hub{padding:1.3em 2em 2em 2em;color:#E2E8F0;}' +
+                '.andrprod-hero{display:flex;gap:1.4em;align-items:flex-start;margin-bottom:1.3em;padding:1.1em 1.3em;border-radius:1em;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.07);}' +
+                '.andrprod-hero__poster{width:7.2em;height:10.5em;border-radius:0.7em;background-color:rgba(255,255,255,.08);background-size:cover;background-position:center;flex-shrink:0;}' +
+                '.andrprod-hero__info{flex:1;min-width:0;}' +
+                '.andrprod-hero__logo{height:2.1em;width:auto;display:block;margin-bottom:0.35em;}' +
+                '.andrprod-hero__title{font-size:1.35em;font-weight:800;color:#F8FAFC;}' +
+                '.andrprod-hero__meta{font-size:0.9em;color:rgba(226,232,240,.72);margin-top:0.25em;}' +
+                '.andrprod-hero__status{font-size:0.9em;color:#38BDF8;font-weight:600;margin-top:0.45em;}' +
+                '.andrprod-hero__actions{display:flex;flex-wrap:wrap;gap:0.55em;margin-top:0.85em;}' +
                 '.andrprod-hub__header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1em;margin-bottom:1.1em;}' +
-                '.andrprod-hub__logo{height:2.4em;width:auto;display:block;}' +
-                '.andrprod-search-title{font-size:1.15em;font-weight:700;color:#F8FAFC;margin-top:0.3em;}' +
-                '.andrprod-hub__stats{font-size:0.88em;color:rgba(226,232,240,.72);margin-top:0.25em;display:flex;align-items:center;flex-wrap:wrap;gap:0.45em;}' +
-                '.andrprod-dot-sep{opacity:.4;}' +
-                '.andrprod-search-tag{color:#38BDF8;font-weight:600;}' +
+                '.andrprod-hub__logo{height:2.2em;width:auto;display:block;}' +
                 '.andrprod-hub__toolbar{display:flex;align-items:center;gap:0.6em;flex-wrap:wrap;}' +
-                '.andrprod-pill{padding:0.55em 1.15em;border-radius:999px;background:rgba(255,255,255,.08);color:#F1F5F9;font-size:0.9em;font-weight:500;transition:background .15s ease,transform .15s ease;}' +
+                '.andrprod-pill{padding:0.55em 1.1em;border-radius:999px;background:rgba(255,255,255,.08);color:#F1F5F9;font-size:0.88em;font-weight:500;transition:background .15s ease,transform .15s ease;}' +
                 '.andrprod-pill.focus{background:#0EA5E9;color:#FFFFFF;transform:scale(1.04);box-shadow:0 0 0 2px #7DD3FC;}' +
-                '.andrprod-hub__tabs{display:flex;flex-wrap:wrap;gap:0.6em;margin-bottom:1.25em;}' +
-                '.andrprod-tab{padding:0.6em 1.2em;border-radius:0.75em;background:rgba(255,255,255,.06);color:rgba(255,255,255,.78);font-size:0.95em;font-weight:500;transition:background .15s ease,transform .15s ease;}' +
-                '.andrprod-tab.is-active{background:rgba(14,165,233,.24);color:#7DD3FC;}' +
-                '.andrprod-tab.focus{background:#0EA5E9;color:#FFFFFF;transform:scale(1.04);}' +
-                '.andrprod-plugin-grid{display:flex;flex-wrap:wrap;gap:1em;margin-bottom:1.4em;}' +
-                '.andrprod-plugin-card{width:19.5em;padding:1.1em 1.2em;border-radius:1em;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.07);display:flex;flex-direction:column;justify-content:space-between;gap:0.95em;transition:transform .16s ease,background .16s ease,box-shadow .16s ease;}' +
-                '.andrprod-plugin-card.focus{transform:scale(1.03);background:rgba(14,165,233,.2);box-shadow:0 0 0 2px #38BDF8;}' +
-                '.andrprod-plugin-card__top{display:flex;align-items:center;gap:0.9em;}' +
-                '.andrprod-plugin-icon{width:3.1em;height:3.1em;border-radius:0.8em;border:1px solid rgba(56,189,248,.3);display:flex;align-items:center;justify-content:center;flex-shrink:0;overflow:hidden;}' +
-                '.andrprod-plugin-icon svg,.andrprod-plugin-icon img{width:100%;height:100%;object-fit:contain;display:block;}' +
-                '.andrprod-plugin-card__name{font-size:1.08em;font-weight:700;color:#F8FAFC;}' +
-                '.andrprod-plugin-card__count{font-size:0.84em;color:rgba(226,232,240,.68);margin-top:0.2em;}' +
-                '.andrprod-plugin-card__bottom{display:flex;align-items:center;justify-content:space-between;font-size:0.84em;padding-top:0.65em;border-top:1px solid rgba(255,255,255,.07);}' +
-                '.andrprod-status-line{display:flex;align-items:center;gap:0.5em;color:rgba(226,232,240,.76);}' +
-                '.andrprod-open-cta{color:#38BDF8;font-weight:700;}' +
-                '.andrprod-detail-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1em;padding:1.1em 1.3em;margin-bottom:1.1em;border-radius:1em;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);}' +
-                '.andrprod-detail-head__left{display:flex;align-items:center;gap:1em;}' +
-                '.andrprod-detail-head__title{font-size:1.35em;font-weight:800;letter-spacing:1.2px;color:#F8FAFC;}' +
-                '.andrprod-detail-head__sub{font-size:0.86em;color:rgba(226,232,240,.7);margin-top:0.25em;display:flex;align-items:center;gap:0.45em;flex-wrap:wrap;}' +
-                '.andrprod-detail-head__actions{display:flex;align-items:center;gap:0.6em;flex-wrap:wrap;}' +
                 '.andrprod-section-title{font-size:1.05em;font-weight:700;color:#7DD3FC;margin:0.9em 0 0.7em 0;}' +
-                '.andrprod-info-bar{display:flex;justify-content:space-between;margin-bottom:0.9em;font-size:0.88em;color:rgba(226,232,240,.72);}' +
-                '.andrprod-source-list{display:flex;flex-direction:column;gap:0.7em;}' +
-                '.andrprod-source-card{display:flex;align-items:center;justify-content:space-between;gap:1em;padding:1em 1.25em;border-radius:0.9em;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.06);transition:background .15s ease,transform .15s ease,box-shadow .15s ease;}' +
-                '.andrprod-source-card.is-best-choice{background:rgba(14,165,233,.16);border-color:rgba(56,189,248,.55);}' +
+                '.andrprod-source-list{display:flex;flex-direction:column;gap:0.68em;}' +
+                '.andrprod-source-card{display:flex;align-items:center;justify-content:space-between;gap:1em;padding:0.95em 1.25em;border-radius:0.9em;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.06);transition:background .15s ease,transform .15s ease,box-shadow .15s ease;}' +
                 '.andrprod-source-card.is-disabled{opacity:.5;}' +
                 '.andrprod-source-card.focus{background:rgba(14,165,233,.24);transform:scale(1.01);box-shadow:0 0 0 2px #38BDF8;}' +
-                '.andrprod-source-card__header{display:flex;align-items:center;gap:0.6em;flex-wrap:wrap;}' +
+                '.andrprod-source-card__header{display:flex;align-items:center;gap:0.55em;flex-wrap:wrap;}' +
                 '.andrprod-plugin-tag{padding:0.18em 0.6em;border-radius:0.4em;background:rgba(56,189,248,.18);color:#7DD3FC;font-size:0.78em;font-weight:700;}' +
-                '.andrprod-source-card__title{font-size:1.04em;font-weight:700;color:#F8FAFC;}' +
-                '.andrprod-chips-row{display:flex;flex-wrap:wrap;gap:0.45em;margin-top:0.5em;}' +
-                '.andrprod-chip{padding:0.2em 0.55em;border-radius:0.4em;background:rgba(255,255,255,.06);font-size:0.78em;color:rgba(226,232,240,.84);}' +
-                '.andrprod-chip .is-yes{color:#4ADE80;}.andrprod-chip .is-no{color:#F87171;}.andrprod-chip .is-unk{color:#94A3B8;}' +
-                '.andrprod-source-card__sub{font-size:0.81em;color:rgba(226,232,240,.62);margin-top:0.45em;}' +
+                '.andrprod-source-card__title{font-size:1.02em;font-weight:700;color:#F8FAFC;}' +
+                '.andrprod-chips-row{display:flex;flex-wrap:wrap;gap:0.45em;margin-top:0.45em;}' +
+                '.andrprod-chip{padding:0.2em 0.55em;border-radius:0.4em;background:rgba(255,255,255,.06);font-size:0.78em;color:rgba(226,232,240,.86);}' +
+                '.andrprod-chip .is-yes{color:#4ADE80;}.andrprod-chip .is-unk{color:#94A3B8;}' +
+                '.andrprod-source-card__sub{font-size:0.81em;color:rgba(226,232,240,.62);margin-top:0.4em;}' +
                 '.andrprod-status-dot{width:0.68em;height:0.68em;border-radius:50%;display:inline-block;flex-shrink:0;}' +
                 '.andrprod-status-dot.is-online{background:#22C55E;box-shadow:0 0 8px rgba(34,197,94,.7);}' +
-                '.andrprod-status-dot.is-ready{background:#38BDF8;box-shadow:0 0 8px rgba(56,189,248,.6);}' +
-                '.andrprod-status-dot.is-offline{background:#EF4444;}.andrprod-status-dot.is-checking{background:#F59E0B;}.andrprod-status-dot.is-unknown{background:#94A3B8;}' +
-                '.andrprod-star{color:#FBBF24;font-weight:700;}' +
+                '.andrprod-status-dot.is-ready{background:#38BDF8;}.andrprod-status-dot.is-offline{background:#EF4444;}.andrprod-status-dot.is-checking{background:#F59E0B;}.andrprod-status-dot.is-unknown{background:#94A3B8;}' +
                 '.andrprod-badge{padding:0.3em 0.8em;border-radius:999px;font-size:0.8em;font-weight:700;white-space:nowrap;}' +
                 '.andrprod-badge.is-on{background:rgba(34,197,94,.18);color:#4ADE80;}.andrprod-badge.is-off{background:rgba(148,163,184,.2);color:#CBD5E1;}' +
                 '.andrprod-settings-list{display:flex;flex-direction:column;gap:0.65em;}' +
-                '.andrprod-setting-row{display:flex;align-items:center;justify-content:space-between;padding:1em 1.25em;border-radius:0.85em;background:rgba(255,255,255,.05);}' +
-                '.andrprod-setting-row.focus{background:rgba(14,165,233,.24);box-shadow:0 0 0 2px #38BDF8;}' +
-                '.andrprod-setting-row__title{font-size:1em;font-weight:600;}.andrprod-setting-row__desc{font-size:0.82em;color:rgba(226,232,240,.62);margin-top:0.2em;}' +
-                '.andrprod-setting-row__val{font-size:0.92em;font-weight:700;color:#38BDF8;margin-left:1.5em;white-space:nowrap;}' +
-                '.andrprod-empty{padding:2.2em 1.5em;text-align:center;background:rgba(255,255,255,.04);border-radius:0.9em;}' +
-                '.andrprod-empty__title{font-size:1.1em;font-weight:600;margin-bottom:0.45em;}.andrprod-empty__desc{font-size:0.9em;color:rgba(226,232,240,.68);max-width:44em;margin:0 auto;}';
-            $('head').append('<style id="andrprod-styles">' + css + '</style>');
+                '.andrprod-setting-row{display:flex;align-items:center;justify-content:space-between;padding:0.95em 1.2em;border-radius:0.85em;background:rgba(255,255,255,.05);}' +
+                '.andrprod-setting-row__title{font-size:0.98em;font-weight:600;}.andrprod-setting-row__val{font-size:0.9em;font-weight:700;color:#38BDF8;margin-left:1.2em;}' +
+                '.andrprod-empty{padding:2em 1.5em;text-align:center;background:rgba(255,255,255,.04);border-radius:0.9em;}' +
+                '.andrprod-empty__title{font-size:1.08em;font-weight:600;margin-bottom:0.4em;}.andrprod-empty__desc{font-size:0.88em;color:rgba(226,232,240,.68);max-width:44em;margin:0 auto;}';
+            $('head').append('<style id="andrprod-dd-styles">' + css + '</style>');
         } catch (e) {
             Diagnostics.logError('injectStyles', e);
         }
     }
 
     // =========================================================================
-    // 17. ПУБЛИЧНЫЙ API (window.ANDRPROD_API)
+    // 15. ПУБЛИЧНЫЙ API (window.ANDRPROD_API)
     // =========================================================================
     window.ANDRPROD_API = {
         version: PLUGIN_VERSION,
         registerAdapter: function (adapter) { return SourceRegistry.registerAdapter(adapter); },
-        getPlugins: function () { return SourceRegistry.getPlugins(); },
-        getPluginSources: function (pluginId) { return SourceRegistry.getPluginSources(pluginId); },
-        getSources: function () { return SourceRegistry.getAllSources(); },
-        getFilteredSources: function (customFilters) { return FilterEngine.apply(SourceRegistry.getAllSources(), customFilters || StorageManager.getFilters()); },
-        getFilters: function () { return StorageManager.getFilters(); },
-        setFilters: function (patch) { return StorageManager.setFilters(patch); },
-        resolveTitles: function (card, method) { return TitleResolver.extractMediaMeta(card, method); },
-        searchMedia: function (card, method, callbacks, options) { return UnifiedSearchEngine.searchAll(card, method, CardIntegration.lastButtonMap, callbacks, options); },
-        evaluateBestChoice: function (results, mediaMeta) { return BestChoiceEngine.evaluate(results, mediaMeta); },
-        launchResult: function (res, mediaMeta) { return UnifiedSearchEngine.launchResult(res, mediaMeta, CardIntegration.lastButtonMap); },
+        getAdapters: function () { return SourceRegistry.getAdapters(); },
+        search: function (card, method, scope, force, callbacks) { return UnifiedSearchEngine.search(card, method, scope, force, callbacks); },
+        cancelSearch: function () { return UnifiedSearchEngine.cancelActiveSearch(); },
+        filterResults: function (list) { return FilterEngine.apply(list); },
+        checkAllSources: function (onEach, onDone) { return UnifiedSearchEngine.checkAllSources(onEach, onDone); },
         getDiagnostics: function () { return Diagnostics.getReport(); },
-        rescan: function (onDone) { SourceRegistry.resetAndScan(); SourceRegistry.discoverAllPluginSources(null, onDone); return SourceRegistry.getPlugins(); },
-        openHub: function (view) { HubLauncher.open({ view: view || 'home' }); },
-        openPlugin: function (pluginId) { HubLauncher.open({ view: 'plugin', pluginId: pluginId }); }
+        storage: StorageManager
     };
 
     // =========================================================================
-    // 18. НАДЁЖНАЯ МОДУЛЬНАЯ ИНИЦИАЛИЗАЦИЯ И РЕГИСТРАЦИЯ В LAMPA
+    // 16. БЕЗОПАСНАЯ ИНИЦИАЛИЗАЦИЯ БЕЗ ЗАВИСИМОСТИ ОТ РАННЕГО jQuery
     // =========================================================================
     function registerManifest() {
         try {
             if (!Lampa.Manifest) return;
-            var manifest = {
+            Lampa.Manifest.plugins = {
                 type: 'video',
                 version: PLUGIN_VERSION,
-                name: 'ANDRPROD',
-                description: 'Единый центр управления онлайн-источниками',
+                name: PLUGIN_NAME,
+                description: 'Единый агрегатор онлайн-источников Lampa',
                 component: HUB_COMPONENT
             };
-            // В Lampa свойство Lampa.Manifest.plugins является сеттером (или массивом)
-            Lampa.Manifest.plugins = manifest;
             Diagnostics.manifestRegistered = true;
         } catch (e) {
             Diagnostics.logError('registerManifest', e);
@@ -3192,90 +1930,63 @@
     }
 
     function startPlugin() {
-        if (window.andrprod_plugin_ready && Diagnostics.cardIntegrationActive) return true;
-
-        // Lampa загружает API не атомарно. Не отмечаем плагин рабочим,
-        // пока не доступны все API, необходимые для кнопки в карточке.
-        if (!window.Lampa || !window.$ ||
-            !Lampa.Component || typeof Lampa.Component.add !== 'function' ||
-            !Lampa.Listener || typeof Lampa.Listener.follow !== 'function') {
-            return false;
+        if (window.andrprod_dd_ready) return;
+        if (!window.Lampa || !window.$) {
+            Diagnostics.logError('Boot', 'Lampa или jQuery ещё не готовы');
+            return;
         }
 
+        registerManifest();
+        injectStyles();
+
         try {
-            registerManifest();
-            injectStyles();
-
-            Lampa.Component.add(HUB_COMPONENT, AndrprodHubComponent);
-            Diagnostics.componentsRegistered.hub = true;
-            Lampa.Component.add(SEARCH_COMPONENT, AndrprodSearchComponent);
-            Diagnostics.componentsRegistered.search = true;
-
-            // Критически важно: без подписки на карточки не объявляем плагин рабочим.
-            if (!CardIntegration.init()) return false;
-
-            try { SourceRegistry.resetAndScan(); }
-            catch (eScan) { Diagnostics.logError('Boot.Scan', eScan); }
-
-            try { SettingsIntegration.init(); }
-            catch (eSet) { Diagnostics.logError('Boot.Settings', eSet); }
-
-            Diagnostics.loaded = true;
-            window.andrprod_plugin_ready = true;
-            window.andrprod_plugin_loaded = true;
-
-            try { SourceRegistry.discoverAllPluginSources(); }
-            catch (eDisc) { Diagnostics.logError('Boot.Discover', eDisc); }
-
-            if (window.console && typeof console.log === 'function') {
-                console.log('[ANDRPROD] Plugin v' + PLUGIN_VERSION + ' initialized; card integration active');
+            if (Lampa.Component && typeof Lampa.Component.add === 'function') {
+                if (!Diagnostics.componentsRegistered.hub) {
+                    Lampa.Component.add(HUB_COMPONENT, AndrprodHubComponent);
+                    Diagnostics.componentsRegistered.hub = true;
+                }
+                if (!Diagnostics.componentsRegistered.search) {
+                    Lampa.Component.add(SEARCH_COMPONENT, AndrprodSearchComponent);
+                    Diagnostics.componentsRegistered.search = true;
+                }
             }
-            return true;
-        } catch (err) {
-            Diagnostics.logError('Boot', err);
-            window.andrprod_plugin_ready = false;
-            window.andrprod_plugin_loaded = false;
-            return false;
+        } catch (eComp) { Diagnostics.logError('Boot.Component', eComp); }
+
+        try { SourceRegistry.resetAndScan(); } catch (eScan) { Diagnostics.logError('Boot.Scan', eScan); }
+        try { CardIntegration.init(); } catch (eCard) { Diagnostics.logError('Boot.Card', eCard); }
+        try { SettingsIntegration.init(); } catch (eSet) { Diagnostics.logError('Boot.Settings', eSet); }
+
+        if (Diagnostics.componentsRegistered.hub && Diagnostics.componentsRegistered.search) {
+            Diagnostics.loaded = true;
+            Diagnostics.initialized = true;
+            window.andrprod_dd_ready = true;
         }
     }
 
     function bootstrap() {
-        var attempts = 0;
-        var maxAttempts = 80;
-        var timer = null;
-
-        function tryStart() {
-            if (window.andrprod_plugin_ready && Diagnostics.cardIntegrationActive) {
-                if (timer) clearInterval(timer);
-                return;
-            }
-            attempts++;
-            if (startPlugin()) {
-                if (timer) clearInterval(timer);
-                return;
-            }
-            if (attempts >= maxAttempts) {
-                if (timer) clearInterval(timer);
-                Diagnostics.logError('Bootstrap', 'Lampa API не готово: не удалось зарегистрировать компоненты и обработчик карточки за 20 секунд');
-            }
+        if (!window.Lampa || !window.$) {
+            var attempts = 0;
+            var timer = setInterval(function () {
+                attempts++;
+                if (window.Lampa && window.$) {
+                    clearInterval(timer);
+                    bootstrap();
+                } else if (attempts >= 40) {
+                    clearInterval(timer);
+                    Diagnostics.logError('Bootstrap', 'Lampa/jQuery не обнаружены после ожидания');
+                }
+            }, 250);
+            return;
         }
 
-        // Сначала пробуем сразу, затем повторяем ожидание появления API.
-        tryStart();
-        if (!(window.andrprod_plugin_ready && Diagnostics.cardIntegrationActive)) {
-            timer = setInterval(tryStart, 250);
-        }
-
-        // Событие app/ready полезно, но не является единственным способом запуска:
-        // подписка может произойти после события, поэтому оставляем страховочный повтор.
-        if (window.Lampa && Lampa.Listener && typeof Lampa.Listener.follow === 'function') {
-            try {
-                Lampa.Listener.follow('app', function (e) {
-                    if (e && e.type === 'ready') tryStart();
-                });
-            } catch (listenErr) {
-                Diagnostics.logError('Bootstrap.Listener', listenErr);
-            }
+        if (window.appready) {
+            startPlugin();
+        } else if (Lampa.Listener && typeof Lampa.Listener.follow === 'function') {
+            Lampa.Listener.follow('app', function (e) {
+                if (e && e.type === 'ready') startPlugin();
+            });
+        } else {
+            startPlugin();
         }
     }
 
